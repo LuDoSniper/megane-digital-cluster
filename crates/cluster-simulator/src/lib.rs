@@ -298,7 +298,7 @@ impl Simulator {
         }
         self.assistance.effective_throttle_pct = throttle * 100.0;
         let brake_force = (self.brake_pct / 100.0) * p.mass_kg * 9.5;
-        let engine_brake_force = if drive_connected && pedal_throttle < 0.03 { 180.0 } else { 0.0 };
+        let engine_brake_force = if drive_connected && throttle < 0.03 { 180.0 } else { 0.0 };
         let net_force = max_traction_n * throttle - resistance_n - brake_force - engine_brake_force;
         let acceleration = net_force / p.mass_kg;
         let old_speed = self.speed_kmh;
