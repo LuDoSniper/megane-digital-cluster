@@ -1,0 +1,45 @@
+name: CI / Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-on-failure: true
+      - name: Format
+        run: cargo fmt --all
+      - name: Unit tests
+        run: cargo test --workspace
+      - name: Build desktop (release)
+        run: cargo build --release -p cluster-app
+      - name: Package portable Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/config | Out-Null
+          Copy-Item target/release/megane-digital-cluster.exe dist/megane-digital-cluster.exe
+          Copy-Item config/cluster.toml dist/config/cluster.toml
+          Copy-Item docs/NOTICE_SECURITE.md dist/NOTICE_SECURITE.txt
+      - name: Upload executable and config
+        uses: actions/upload-artifact@v4
+        with:
+          name: megane-digital-cluster-windows-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 21
