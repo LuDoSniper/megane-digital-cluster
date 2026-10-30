@@ -131,3 +131,13 @@ L'**affichage** reçoit un `VehicleSnapshot` (vitesse, régime, état des voyant
 - Limiteur simulé : plafonnement **effectif** de la demande moteur, sans freinage automatique ; dépassement volontaire (pédale ≥ 98 %) et avertissement en descente.
 - Le laboratoire (`F2`) montre la différence entre la **pédale demandée** et le **gaz réellement commandé** par les règles simulées. On peut également modifier l'embrayage (`J`) et la pente.
 - Ces règles s'inspirent de la documentation Renault X84 et **ne prétendent pas être une implémentation légale/certifiée ni identique à tous les niveaux d'équipement de 2004**. Aucun raccordement à un calculateur réel.
+
+
+## V0.4 — Commandes physiques et interfaces
+
+- Maintenir **↑** pour appliquer progressivement l'accélérateur (0 → 100 % en ~0,3 s), puis relâcher : retour automatique à zéro (~0,25 s). Maintenir **↓** pour le frein, avec le même retour automatique. Les curseurs du laboratoire restent des commandes manuelles indépendantes.
+- **←/→** ajustent la consigne du régulateur/limiteur ; pavé numérique 1–5, 0, R inchangés ; libération automatique des pédales lors de la perte du focus de la fenêtre.
+- Choisir en laboratoire l'une des dispositions **RS Digital (original, par défaut)**, **Grand Touring** ou **Essentiel**. Les coloris RS/Classique/Glacier restent indépendants de la disposition. Config : `layout = "original"`.
+- Géométrie des arcs de compteurs fixe ; seule la longueur visible est animée via le `stroke-dashoffset` SVG, corrigeant les déformations observées lors des variations rapides.
+- Ouvrants d'une **Sedan 4 portes** (4 portes, coffre, capot) et 4 capteurs TPMS virtuels indépendants, avec scénarios de dégonflage et panne. Les alertes ne sont pas dérivées côté affichage.
+- Dynamique longitudinale du profil K4M + **boîte JH3 142 provisoire**, couple moteur interpolé, vrais rapports/démultiplication, dimensions pneus, résistances aérodynamiques/de roulement, pente et inertie. **Il reste des hypothèses importantes** : [références et limites](docs/VEHICLE_SOURCES.md). Ne pas traiter les valeurs comme exactes pour le véhicule réel.

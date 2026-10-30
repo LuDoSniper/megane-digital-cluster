@@ -153,6 +153,34 @@ pub enum TelemetryStatus { Simulated, Paused, Partial, Disconnected, Measured }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShiftAdvice { None, Up, Down }
 
+/// Four physical doors plus separately hinged trunk. Always Sedan (LM0/1_).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Aperture { FrontLeft, FrontRight, RearLeft, RearRight, Trunk, Bonnet }
+impl Aperture { pub const ALL: [Self; 6] = [Self::FrontLeft, Self::FrontRight, Self::RearLeft, Self::RearRight, Self::Trunk, Self::Bonnet];
+    pub fn label(self) -> &'static str { match self { Self::FrontLeft => "Avant gauche", Self::FrontRight => "Avant droite", Self::RearLeft => "Arrière gauche", Self::RearRight => "Arrière droite", Self::Trunk => "Coffre", Self::Bonnet => "Capot" } }
+    pub fn index(self) -> usize { match self { Self::FrontLeft => 0, Self::FrontRight => 1, Self::RearLeft => 2, Self::RearRight => 3, Self::Trunk => 4, Self::Bonnet => 5 } }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyOpenings { pub open: [bool; 6] }
+impl BodyOpenings { pub fn any_open(self) -> bool { self.open.iter().any(|&v| v) }
+    pub fn is_open(self, which: Aperture) -> bool { self.open[which.index()] }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Wheel { FrontLeft, FrontRight, RearLeft, RearRight }
+impl Wheel {
+    pub const ALL: [Self; 4] = [Self::FrontLeft, Self::FrontRight, Self::RearLeft, Self::RearRight];
+    pub fn index(self) -> usize { match self { Self::FrontLeft => 0, Self::FrontRight => 1, Self::RearLeft => 2, Self::RearRight => 3 } }
+    pub fn label(self) -> &'static str { match self { Self::FrontLeft => "Avant G", Self::FrontRight => "Avant D", Self::RearLeft => "Arrière G", Self::RearRight => "Arrière D" } }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TyreAlert { Normal, Underinflated, Critical, SensorFault, Unknown }
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TyreReading { pub pressure_bar: Reading<f64>, pub alert: TyreAlert }
+impl TyreReading { pub fn unknown() -> Self { Self { pressure_bar: Reading::unknown(), alert: TyreAlert::Unknown } } }
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TyreMonitoring { pub wheels: [TyreReading; 4] }
+impl TyreMonitoring { pub fn unknown() -> Self { Self { wheels: [TyreReading::unknown(); 4] } } }
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VehicleSnapshot {
     pub speed_kmh: Reading<f64>,
@@ -168,6 +196,9 @@ pub struct VehicleSnapshot {
     pub engine_running: Reading<bool>,
     pub assistance: Reading<SpeedAssistance>,
     pub shift_advice: Reading<ShiftAdvice>,
+    /// Optional body module and TPMS input, never inferred from generic OBD speed/RPM.
+    pub openings: Reading<BodyOpenings>,
+    pub tyres: Reading<TyreMonitoring>,
     pub status: TelemetryStatus,
     pub lights: WarningLights,
     pub elapsed_simulation_s: f64,
@@ -181,7 +212,7 @@ impl Default for VehicleSnapshot {
             battery_v: Reading::unknown(), trip_km: Reading::unknown(),
             odometer_km: Reading::unknown(), gear: Reading::unknown(),
             engine_running: Reading::unknown(), assistance: Reading::unknown(),
-            shift_advice: Reading::unknown(), status: TelemetryStatus::Disconnected,
+            shift_advice: Reading::unknown(), openings: Reading::unknown(), tyres: Reading::unknown(), status: TelemetryStatus::Disconnected,
             lights: WarningLights::unknown(), elapsed_simulation_s: 0.0,
         }
     }
@@ -217,6 +248,8 @@ mod tests {
         assert!(frame.gear.usable().is_none());
         assert!(frame.assistance.usable().is_none());
         assert!(frame.shift_advice.usable().is_none());
+        assert!(frame.openings.usable().is_none());
+        assert!(frame.tyres.usable().is_none());
     }
 
     #[test]

@@ -1,11 +1,11 @@
-# Phase 1: simulation only. "fullscreen" controls STARTUP mode.
-# Windowed by default, so the developer can use other applications alongside.
+# Phase 1 — simulation uniquement. Fenêtre redimensionnable par défaut.
 [window]
 fullscreen = false
 width = 1360
 height = 840
 
 [interface]
-theme = "rs"       # rs | classic | ice
+theme = "rs"           # rs | classic | ice (couleurs)
+layout = "original"   # original | touring | focus (dispositions)
 tick_ms = 50
-show_lab_on_start = false # true pour ouvrir le laboratoire au lancement      # simulated telemetry refresh (16..250 ms)
+show_lab_on_start = false

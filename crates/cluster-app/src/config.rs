@@ -33,13 +33,14 @@ impl Default for WindowConfig {
 #[serde(default)]
 pub struct InterfaceConfig {
     pub theme: Theme,
+    pub layout: Layout,
     pub tick_ms: u64,
     pub show_lab_on_start: bool,
 }
 
 impl Default for InterfaceConfig {
     fn default() -> Self {
-        Self { theme: Theme::Rs, tick_ms: 50, show_lab_on_start: false }
+        Self { theme: Theme::Rs, layout: Layout::Original, tick_ms: 50, show_lab_on_start: false }
     }
 }
 
@@ -54,6 +55,14 @@ impl Theme {
     pub fn label(self) -> &'static str {
         match self { Self::Rs => "RS", Self::Classic => "Classique", Self::Ice => "Glacier" }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all="snake_case")]
+pub enum Layout { Original, Touring, Focus }
+impl Layout {
+    pub fn class(self) -> &'static str { match self { Self::Original=>"layout-original",Self::Touring=>"layout-touring",Self::Focus=>"layout-focus" } }
+    pub fn label(self) -> &'static str { match self { Self::Original=>"RS Digital (original)",Self::Touring=>"Grand Touring",Self::Focus=>"Essentiel" } }
 }
 
 impl AppConfig {

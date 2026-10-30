@@ -1,9 +1,9 @@
 mod config;
 mod display;
 
-use cluster_core::{AssistanceMode, Gear, TelemetrySource, VehicleSnapshot};
+use cluster_core::{Aperture, AssistanceMode, Gear, TelemetrySource, VehicleSnapshot, Wheel};
 use cluster_simulator::{Command, Lamp, Scenario, Simulator};
-use config::{AppConfig, Theme};
+use config::{AppConfig, Layout, Theme};
 use display::Instrument;
 use dioxus::prelude::*;
 use dioxus_desktop::tao::window::Fullscreen;
@@ -36,10 +36,12 @@ fn dispatch(mut sim: Signal<Simulator>, mut reading: Signal<VehicleSnapshot>, co
 fn handle_shortcut(code: &str, sim: Signal<Simulator>, reading: Signal<VehicleSnapshot>, mut show_lab: Signal<bool>) {
     let state = sim.read().clone();
     let command = match code {
-        "ArrowUp" => Some(Command::Accelerator(state.accelerator_pct + 5.0)),
-        "ArrowDown" => Some(Command::Accelerator(state.accelerator_pct - 5.0)),
-        "ArrowRight" => Some(Command::Brake(state.brake_pct + 5.0)),
-        "ArrowLeft" => Some(Command::Brake(state.brake_pct - 5.0)),
+        "hold:ArrowUp" => Some(Command::HoldAccelerator(true)),
+        "release:ArrowUp" => Some(Command::HoldAccelerator(false)),
+        "hold:ArrowDown" => Some(Command::HoldBrake(true)),
+        "release:ArrowDown" => Some(Command::HoldBrake(false)),
+        "ArrowRight" => Some(Command::AdjustAssistance(1.0)),
+        "ArrowLeft" => Some(Command::AdjustAssistance(-1.0)),
         "Digit0" | "Numpad0" => Some(Command::SetGear(Gear::Neutral)),
         "Digit1" | "Numpad1" => Some(Command::SetGear(Gear::First)),
         "Digit2" | "Numpad2" => Some(Command::SetGear(Gear::Second)),
@@ -73,6 +75,7 @@ fn app() -> Element {
     let mut sim = use_signal(Simulator::default);
     let mut reading = use_signal(|| Simulator::default().snapshot());
     let mut theme = use_signal(|| config.interface.theme);
+    let mut layout = use_signal(|| config.interface.layout);
     let mut show_lab = use_signal(|| config.interface.show_lab_on_start);
     let mut show_help = use_signal(|| false);
     let tick_ms = config.interface.tick_ms;
@@ -93,22 +96,36 @@ fn app() -> Element {
     // Ignore text entry and modifier combinations. All interactions are simulator-only.
     use_future(move || async move {
         let mut eval = document::eval(r#"
-            const keys = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
+            const keys = new Set(['ArrowLeft','ArrowRight',
               'Digit0','Digit1','Digit2','Digit3','Digit4','Digit5',
               'Numpad0','Numpad1','Numpad2','Numpad3','Numpad4','Numpad5',
               'NumpadDecimal','NumpadEnter','NumpadAdd','NumpadSubtract',
               'KeyR','KeyJ','KeyQ','KeyE','KeyH','KeyB','KeyF','KeyC','KeyV',
               'KeyX','KeyZ','Space','Enter','Equal','Minus','F2','Escape']);
-            const repeating = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','NumpadAdd','NumpadSubtract','Equal','Minus']);
-            const handler = (event) => {
-              if (!keys.has(event.code) || event.altKey || event.ctrlKey || event.metaKey) return;
-              const target = event.target;
-              if (target && (['INPUT','SELECT','TEXTAREA'].includes(target.tagName) || target.isContentEditable)) return;
-              event.preventDefault();
-              if (event.repeat && !repeating.has(event.code)) return;
-              dioxus.send(event.code);
+            const pedals = new Set(['ArrowUp','ArrowDown']);
+            const repeating = new Set(['ArrowLeft','ArrowRight','NumpadAdd','NumpadSubtract','Equal','Minus']);
+            const held = new Set();
+            const focusedInput = (ev) => ev.target && ((['SELECT','TEXTAREA'].includes(ev.target.tagName) || (ev.target.tagName === 'INPUT' && ev.target.type !== 'range')) || ev.target.isContentEditable);
+            const keyDown = (ev) => {
+              if (ev.ctrlKey || ev.altKey || ev.metaKey || focusedInput(ev)) return;
+              if (pedals.has(ev.code)) {
+                ev.preventDefault();
+                if (!held.has(ev.code)) { held.add(ev.code); dioxus.send('hold:'+ev.code); }
+              } else if (keys.has(ev.code)) {
+                ev.preventDefault();
+                if (!ev.repeat || repeating.has(ev.code)) dioxus.send(ev.code);
+              }
             };
-            window.addEventListener('keydown', handler);
+            const keyUp = (ev) => {
+              if (pedals.has(ev.code) && held.delete(ev.code)) {
+                ev.preventDefault(); dioxus.send('release:'+ev.code);
+              }
+            };
+            const releaseAll = () => { for(const code of held) dioxus.send('release:'+code); held.clear(); };
+            window.addEventListener('keydown',keyDown);
+            window.addEventListener('keyup',keyUp);
+            window.addEventListener('blur',releaseAll);
+            document.addEventListener('visibilitychange', () => { if(document.hidden) releaseAll(); });
             await new Promise(() => {});
         "#);
         while let Ok(code) = eval.recv::<String>().await {
@@ -121,11 +138,13 @@ fn app() -> Element {
     let sim_setpoint = state.assistance.setpoint_kmh.map(|v| format!("{v:.0} km/h")).unwrap_or_else(|| "—".to_string());
     let current_theme = theme();
     let theme_class = current_theme.class();
+    let current_layout = layout();
+    let layout_class = current_layout.class();
     let lab_class = if show_lab() { "lab-open" } else { "lab-closed" };
 
     rsx! {
         document::Style { "{CSS}" }
-        div { class: "app-shell {theme_class} {lab_class}",
+        div { class: "app-shell {theme_class} {layout_class} {lab_class}",
             div { class: "view-toolbar",
                 div { class: "view-title", span { class: "view-emblem", "◇" } span { "MÉGANE DIGITAL CLUSTER" } }
                 div { class: "view-tools",
@@ -139,13 +158,13 @@ fn app() -> Element {
                 div { class: "shortcut-help",
                     button { class: "help-close", onclick: move |_| show_help.set(false), "✕" }
                     strong { "RACCOURCIS SIMULATEUR" }
-                    p { "↑ ↓ : accélérateur ± 5 % · ← → : frein ± 5 % · J : embrayage · Pavé numérique 1–5 : rapport · 0 : point mort · R ou . pavé : marche arrière (à l'arrêt)." }
+                    p { "↑ maintenue : accélérer · ↓ maintenue : freiner · relâcher : pédale revient à 0 % · ← → : consigne −/+ 1 km/h · J : embrayage · Pavé 1–5 : rapport · 0 : point mort · R : marche arrière (à l'arrêt)." }
                     p { "Q / E : clignotants · H : détresse · B : feux de croisement · F : pleins phares · C : régulateur · V : limiteur." }
                     p { "Entrée : mémoriser vitesse (≥ 30 km/h) · + / − : consigne · X : annuler · Z : reprendre · Espace : pause · F2 : labo · Échap : fermer." }
                 }
             }
             main { class: "instrument-workspace",
-                Instrument { data: data.clone() }
+                Instrument { data: data.clone(), layout: current_layout }
                 if show_lab() {
                     aside { class: "control-panel",
                         div { class: "aside-header",
@@ -244,6 +263,37 @@ fn app() -> Element {
                             }
                         }
                         div { class: "control-section",
+                            span { class: "field-label", "OUVRANTS · SEDAN 4 PORTES" }
+                            div { class: "toggle-grid",
+                                for aperture in Aperture::ALL {
+                                    button { key: "{aperture:?}",
+                                        class: if state.openings.is_open(aperture) { "lamp-toggle active" } else { "lamp-toggle" },
+                                        onclick: move |_| dispatch(sim, reading, Command::ToggleOpening(aperture)),
+                                        "{aperture.label()} · "
+                                        if state.openings.is_open(aperture) { "ouvert" } else { "fermé" }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "control-section",
+                            span { class: "field-label", "PRESSION DES PNEUMATIQUES · SIMULATION" }
+                            for wheel in Wheel::ALL {
+                                div { key: "{wheel:?}", class: "range-header",
+                                    span { class: "field-label", "{wheel.label()}" }
+                                    strong { "{state.tyre_pressure_bar[wheel.index()]:.1} bar" }
+                                }
+                                input { r#type: "range", min: "0", max: "3.5", step: "0.1",
+                                    value: "{state.tyre_pressure_bar[wheel.index()]}",
+                                    oninput: move |event| if let Ok(v)=event.value().parse::<f64>() { dispatch(sim, reading, Command::SetTyrePressure(wheel,v)); }
+                                }
+                                button { class: if state.tyre_sensor_fault[wheel.index()] { "lamp-toggle active" } else { "lamp-toggle" },
+                                    onclick: move |_| dispatch(sim, reading, Command::ToggleTyreSensor(wheel)),
+                                    if state.tyre_sensor_fault[wheel.index()] { "Capteur indisponible · rétablir" } else { "Simuler panne capteur" }
+                                }
+                            }
+                            small { class: "mini-help", "Seuils illustratifs du simulateur, différents de la logique Renault. Pressions réelles à vérifier sur l'étiquette du véhicule." }
+                        }
+                        div { class: "control-section",
                             span { class: "field-label", "INJECTION DE VOYANTS (SIMULÉS)" }
                             div { class: "toggle-grid",
                                 LampToggle { label: "Moteur", lamp: Lamp::Engine, active: state.lamp_active(Lamp::Engine), sim, reading }
@@ -257,6 +307,14 @@ fn app() -> Element {
                         }
                         div { class: "control-section",
                             span { class: "field-label", "AFFICHAGE" }
+                            span { class: "field-label", "DISPOSITION · PAR DÉFAUT RS DIGITAL" }
+                            div { class: "layout-controls",
+                                for choice in [Layout::Original, Layout::Touring, Layout::Focus] {
+                                    button { key: "{choice:?}", class: if current_layout == choice { "theme-button selected" } else { "theme-button" },
+                                        onclick: move |_| layout.set(choice), "{choice.label()}" }
+                                }
+                            }
+                            span { class: "field-label", "COULEURS" }
                             div { class: "theme-controls",
                                 for choice in [Theme::Rs, Theme::Classic, Theme::Ice] {
                                     button { key: "{choice:?}", class: if current_theme == choice { "theme-button selected" } else { "theme-button" },

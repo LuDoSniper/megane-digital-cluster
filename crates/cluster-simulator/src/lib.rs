@@ -1,8 +1,11 @@
 //! Offline vehicle dynamics and control policies for the simulator ONLY.
 //! Real OBD adapters implement TelemetrySource independently and must never call this module.
 
+mod vehicle;
+pub use vehicle::VehicleProfile;
+
 use cluster_core::{
-    AssistanceMode, DataQuality, Gear, InterruptionReason, LampState, Reading, ShiftAdvice,
+    Aperture, AssistanceMode, BodyOpenings, DataQuality, Gear, InterruptionReason, LampState, Reading, ShiftAdvice, TyreAlert, TyreMonitoring, TyreReading, Wheel,
     SpeedAssistance, TelemetrySource, TelemetryStatus, VehicleSnapshot, WarningLights,
 };
 use std::time::Duration;
@@ -27,6 +30,7 @@ pub enum Lamp { Engine, Oil, Battery, Abs, Airbag, Brake, Seatbelt, Left, Right,
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
     Accelerator(f64), Brake(f64), Clutch(f64), RoadSlope(f64),
+    HoldAccelerator(bool), HoldBrake(bool), ToggleOpening(Aperture), SetTyrePressure(Wheel, f64), ToggleTyreSensor(Wheel),
     ShiftUp, ShiftDown, SetGear(Gear), ToggleEngine,
     SetScenario(Scenario), ToggleLamp(Lamp), ToggleHazards,
     SetAssistance(AssistanceMode), SetAssistanceSpeed, AdjustAssistance(f64),
@@ -53,6 +57,14 @@ pub struct Simulator {
     pub trip_km: f64,
     pub odometer_km: f64,
     pub elapsed_s: f64,
+    pub profile: VehicleProfile,
+    pub openings: BodyOpenings,
+    pub tyre_pressure_bar: [f64; 4],
+    pub tyre_sensor_fault: [bool; 4],
+    pub keyboard_accelerator_down: bool,
+    pub keyboard_brake_down: bool,
+    keyboard_accelerator_owned: bool,
+    keyboard_brake_owned: bool,
     pub hazards: bool,
     pub assistance: SpeedAssistance,
     lamps: [bool; 11],
@@ -62,11 +74,16 @@ impl Default for Simulator {
     fn default() -> Self {
         Self {
             speed_kmh: 42.0, rpm: 2226.0, coolant_c: 82.0,
-            fuel_pct: 68.0, voltage: 14.1, accelerator_pct: 26.0, brake_pct: 0.0,
+            fuel_pct: 68.0, voltage: 14.1, accelerator_pct: 0.0, brake_pct: 0.0,
             clutch_pct: 0.0, road_slope_pct: 0.0,
             gear: Gear::Third, engine_running: true, paused: false,
             scenario: Scenario::Drive, trip_km: 0.0, odometer_km: 182_450.0,
-            elapsed_s: 0.0, hazards: false, assistance: SpeedAssistance::default(),
+            elapsed_s: 0.0, profile: VehicleProfile::default(),
+            openings: BodyOpenings { open: [false;6] },
+            tyre_pressure_bar: [2.2,2.2,2.0,2.0], tyre_sensor_fault: [false;4],
+            keyboard_accelerator_down: false, keyboard_brake_down: false,
+            keyboard_accelerator_owned: false, keyboard_brake_owned: false,
+            hazards: false, assistance: SpeedAssistance::default(),
             lamps: [false; 11],
         }
     }
@@ -118,9 +135,14 @@ impl Simulator {
 
     pub fn apply(&mut self, command: Command) {
         match command {
-            Command::Accelerator(v) => self.accelerator_pct = v.clamp(0.0, 100.0),
+            Command::Accelerator(v) => { self.accelerator_pct = v.clamp(0.0,100.0); self.keyboard_accelerator_owned = false; },
+            Command::HoldAccelerator(held) => { self.keyboard_accelerator_down=held; self.keyboard_accelerator_owned=true; },
+            Command::HoldBrake(held) => { self.keyboard_brake_down=held; self.keyboard_brake_owned=true; },
+            Command::ToggleOpening(which) => self.openings.open[which.index()] = !self.openings.open[which.index()],
+            Command::SetTyrePressure(which, pressure) => { self.tyre_pressure_bar[which.index()] = pressure.clamp(0.0,3.5); },
+            Command::ToggleTyreSensor(which) => { let i=which.index(); self.tyre_sensor_fault[i]=!self.tyre_sensor_fault[i]; },
             Command::Brake(v) => {
-                self.brake_pct = v.clamp(0.0, 100.0);
+                self.brake_pct = v.clamp(0.0, 100.0); self.keyboard_brake_owned = false;
                 if self.brake_pct > 2.0 && self.assistance.mode == AssistanceMode::Cruise {
                     self.interrupt(InterruptionReason::Brake);
                 }
@@ -219,15 +241,31 @@ impl Simulator {
         let dt = delta.as_secs_f64().clamp(0.0, 0.2);
         if dt <= 0.0 { return; }
         self.elapsed_s += dt;
+        // Continuous physical pedal input: fast press, spring return after key release.
+        if self.keyboard_accelerator_owned {
+            let target = if self.keyboard_accelerator_down { 100.0 } else { 0.0 };
+            let rate = if self.keyboard_accelerator_down { 340.0 } else { 420.0 };
+            self.accelerator_pct += (target-self.accelerator_pct).clamp(-rate*dt, rate*dt);
+        }
+        if self.keyboard_brake_owned {
+            let target = if self.keyboard_brake_down { 100.0 } else { 0.0 };
+            let rate = if self.keyboard_brake_down { 360.0 } else { 520.0 };
+            self.brake_pct += (target-self.brake_pct).clamp(-rate*dt, rate*dt);
+            if self.brake_pct > 2.0 && self.assistance.mode == AssistanceMode::Cruise { self.interrupt(InterruptionReason::Brake); }
+        }
 
-        // Approximate longitudinal vehicle dynamics. This is NOT Renault ECU logic.
-        let drag = 0.18 + self.speed_kmh * 0.008; // m/s²
-        let slope_accel = -9.81 * self.road_slope_pct / 100.0; // downhill adds speed
+        let p = self.profile;
         let pedal_throttle = if self.engine_running { self.accelerator_pct / 100.0 } else { 0.0 };
-        let drive_connected = self.engine_running && self.clutch_pct <= 2.0
-            && !matches!(self.gear, Gear::Neutral);
+        let drive_connected = self.engine_running && self.clutch_pct <= 2.0 && self.gear != Gear::Neutral;
+        let coupled_rpm = p.rpm_at_speed(self.gear, self.speed_kmh);
+        // Simulated low-speed clutch slip lets first gear move from standstill.
+        let launch_slip_rpm = if self.speed_kmh < 9.0 { (1.0-self.speed_kmh/9.0) * pedal_throttle * 1600.0 } else { 0.0 };
+        let engine_rpm = if !self.engine_running { 0.0 } else if drive_connected {
+            coupled_rpm.max(760.0+launch_slip_rpm).clamp(760.0,6900.0)
+        } else { 760.0 + self.accelerator_pct*35.0 };
+        let max_traction_n = if drive_connected && coupled_rpm < 6750.0 { p.max_drive_force_n(self.gear, engine_rpm) } else { 0.0 };
+        let resistance_n = p.resistance_n(self.speed_kmh, self.road_slope_pct);
         let mut throttle = if drive_connected { pedal_throttle } else { 0.0 };
-
         self.assistance.temporarily_overridden = false;
         self.assistance.unable_to_hold = false;
         if self.assistance.active {
@@ -241,45 +279,33 @@ impl Simulator {
         }
         if self.assistance.active {
             if let Some(target) = self.assistance.setpoint_kmh {
+                let desired_accel = (target - self.speed_kmh) * 0.065; // m/s² per km/h error
+                let requested_force = resistance_n + p.mass_kg * desired_accel;
+                let regulated_throttle = if max_traction_n > 1.0 { (requested_force / max_traction_n).clamp(0.0,1.0) } else { 0.0 };
                 match self.assistance.mode {
                     AssistanceMode::Cruise => {
-                        // Controller compensates for drag and slope; cannot apply brakes.
-                        let error = target - self.speed_kmh;
-                        let automatic = ((drag - slope_accel + error * 0.30) / 4.5).clamp(0.0, 1.0);
-                        if pedal_throttle > automatic + 0.035 {
-                            self.assistance.temporarily_overridden = true;
-                            throttle = pedal_throttle;
-                        } else {
-                            throttle = automatic;
-                        }
+                        if pedal_throttle > regulated_throttle + 0.035 { self.assistance.temporarily_overridden=true; throttle=pedal_throttle; }
+                        else { throttle=regulated_throttle; }
                     }
                     AssistanceMode::Limiter => {
-                        // Driver still controls speed until reaching the target; throttle is capped.
-                        // 'Kickdown' is simulated at >98%, not an OBD/ECU instruction.
-                        if self.accelerator_pct >= 98.0 {
-                            self.assistance.temporarily_overridden = true;
-                        } else {
-                            let permitted = ((drag - slope_accel + (target - self.speed_kmh) * 0.30) / 4.5).clamp(0.0, 1.0);
-                            throttle = throttle.min(permitted);
-                        }
+                        if self.accelerator_pct >= 98.0 { self.assistance.temporarily_overridden=true; }
+                        else { throttle=throttle.min(regulated_throttle); }
                     }
                     AssistanceMode::Off => self.interrupt(InterruptionReason::DriverCancel),
                 }
-                // On a descent, neither simulated assistance system applies the brakes.
-                self.assistance.unable_to_hold = self.speed_kmh > target + 2.0
-                    && !self.assistance.temporarily_overridden;
+                self.assistance.unable_to_hold = self.speed_kmh > target + 2.0 && !self.assistance.temporarily_overridden;
             }
         }
-
         self.assistance.effective_throttle_pct = throttle * 100.0;
-        let deceleration = self.brake_pct / 100.0 * 9.5;
-        let acceleration = throttle * 4.5 - drag + slope_accel - deceleration;
+        let brake_force = (self.brake_pct / 100.0) * p.mass_kg * 9.5;
+        let engine_brake_force = if drive_connected && pedal_throttle < 0.03 { 180.0 } else { 0.0 };
+        let net_force = max_traction_n * throttle - resistance_n - brake_force - engine_brake_force;
+        let acceleration = net_force / p.mass_kg;
         let old_speed = self.speed_kmh;
-        let maximum = if self.gear == Gear::Reverse { 25.0 } else { 210.0 };
+        let maximum = if self.gear == Gear::Reverse { 25.0 } else { 195.0 }; // conservative published upper-speed approximation
         self.speed_kmh = (self.speed_kmh + acceleration * dt * 3.6).clamp(0.0, maximum);
-        let target_rpm = if !self.engine_running { 0.0 }
-            else if !drive_connected { 760.0 + self.accelerator_pct * 35.0 }
-            else { (self.speed_kmh * self.gear.rpm_per_kmh()).clamp(760.0, 6900.0) };
+        let target_rpm = if !self.engine_running { 0.0 } else if !drive_connected { 760.0+self.accelerator_pct*35.0 }
+            else { p.rpm_at_speed(self.gear,self.speed_kmh).max(760.0+launch_slip_rpm).clamp(760.0,6900.0) };
         self.rpm += (target_rpm - self.rpm) * (dt * 6.0).clamp(0.0, 1.0);
         self.rpm = self.rpm.clamp(0.0, 7000.0);
         let cruise_temp = if self.engine_running { 90.0 } else { 30.0 };
@@ -321,6 +347,17 @@ impl TelemetrySource for Simulator {
             gear: Reading::simulated(self.gear), engine_running: Reading::simulated(self.engine_running),
             assistance: Reading::simulated(self.assistance),
             shift_advice: Reading::simulated(shift_advice(self.gear, self.rpm, self.engine_running)),
+            openings: Reading::simulated(self.openings),
+            tyres: Reading::simulated(TyreMonitoring { wheels: std::array::from_fn(|i| {
+                let pressure = self.tyre_pressure_bar[i];
+                let reference = if i < 2 { 2.2 } else { 2.0 };
+                // Test-only thresholds! Real wheel fault states come from the adapter.
+                let alert = if self.tyre_sensor_fault[i] { TyreAlert::SensorFault }
+                    else if pressure < reference-0.65 { TyreAlert::Critical }
+                    else if pressure < reference-0.30 { TyreAlert::Underinflated }
+                    else { TyreAlert::Normal };
+                TyreReading { pressure_bar: if self.tyre_sensor_fault[i] { Reading::unknown() } else { Reading::simulated(pressure) }, alert }
+            }) }),
             status, lights: self.lamp_states(), elapsed_simulation_s: self.elapsed_s,
         };
         if self.scenario == Scenario::SensorFailure {
@@ -329,6 +366,8 @@ impl TelemetrySource for Simulator {
             data.coolant_c = Reading::unknown();
             data.shift_advice = Reading::unknown();
             data.assistance = Reading::unknown();
+            data.tyres = Reading::unknown();
+            data.openings = Reading::unknown();
         } else if self.scenario == Scenario::LinkLost {
             data.speed_kmh.quality = DataQuality::Stale;
             data.rpm.quality = DataQuality::Stale;
@@ -342,6 +381,8 @@ impl TelemetrySource for Simulator {
             data.assistance = Reading::unknown();
             data.shift_advice = Reading::unknown();
             data.lights = WarningLights::unknown();
+            data.tyres = Reading::unknown();
+            data.openings = Reading::unknown();
         }
         data
     }
@@ -520,13 +561,53 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_pedals_accelerate_then_spring_back() {
+        let mut sim=Simulator::default();
+        sim.apply(Command::HoldAccelerator(true));
+        run(&mut sim, 1);
+        assert!(sim.accelerator_pct > 99.0);
+        sim.apply(Command::HoldAccelerator(false));
+        run(&mut sim, 1);
+        assert_eq!(sim.accelerator_pct, 0.0);
+        sim.apply(Command::HoldBrake(true));
+        run(&mut sim, 1);
+        assert_eq!(sim.brake_pct, 100.0);
+        sim.apply(Command::HoldBrake(false));
+        run(&mut sim, 1);
+        assert_eq!(sim.brake_pct, 0.0);
+    }
+    #[test]
+    fn door_and_tyre_states_publish_and_fail_closed() {
+        let mut sim=Simulator::default();
+        sim.apply(Command::ToggleOpening(Aperture::RearRight));
+        sim.apply(Command::SetTyrePressure(Wheel::FrontLeft, 1.3));
+        let snap=sim.snapshot();
+        assert!(snap.openings.usable().unwrap().is_open(Aperture::RearRight));
+        assert_eq!(snap.tyres.usable().unwrap().wheels[0].alert,TyreAlert::Critical);
+        sim.apply(Command::ToggleTyreSensor(Wheel::FrontLeft));
+        assert_eq!(sim.snapshot().tyres.usable().unwrap().wheels[0].alert,TyreAlert::SensorFault);
+        sim.apply(Command::SetScenario(Scenario::LinkLost));
+        assert!(sim.snapshot().openings.usable().is_none());
+        assert!(sim.snapshot().tyres.usable().is_none());
+    }
+    #[test]
+    fn gear_ratio_changes_acceleration_and_rpm() {
+        let mut low=moving(50.0); let mut high=low.clone();
+        low.apply(Command::SetGear(Gear::Second)); high.apply(Command::SetGear(Gear::Fifth));
+        low.apply(Command::Accelerator(65.0));high.apply(Command::Accelerator(65.0));
+        run(&mut low,2);run(&mut high,2);
+        assert!(low.speed_kmh>high.speed_kmh, "2nd={} 5th={}",low.speed_kmh,high.speed_kmh);
+        assert!(low.rpm>high.rpm);
+    }
+
+    #[test]
     fn simulation_values_stay_bounded() {
         let mut sim = Simulator::default();
         sim.apply(Command::Accelerator(999.0));
         sim.apply(Command::Brake(-2.0));
         sim.apply(Command::RoadSlope(-999.0));
         run(&mut sim, 200);
-        assert!((0.0..=210.0).contains(&sim.speed_kmh));
+        assert!((0.0..=195.0).contains(&sim.speed_kmh));
         assert!((0.0..=100.0).contains(&sim.fuel_pct));
         assert!((0.0..=7000.0).contains(&sim.rpm));
         assert_eq!(sim.road_slope_pct, -12.0);

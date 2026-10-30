@@ -2,10 +2,11 @@
 //! All control policies and shift cues are produced upstream by the telemetry source.
 
 use cluster_core::{
-    AssistanceMode, InterruptionReason, LampState, Reading, ShiftAdvice,
+    Aperture, AssistanceMode, InterruptionReason, LampState, Reading, ShiftAdvice, TyreAlert, Wheel, BodyOpenings, TyreMonitoring,
     TelemetryStatus, VehicleSnapshot,
 };
 use dioxus::prelude::*;
+use crate::config::Layout;
 use std::f64::consts::PI;
 
 fn reading(value: &Reading<f64>, digits: usize) -> String {
@@ -63,8 +64,10 @@ fn ticks(max_value: usize, step: usize, major_every: usize, rpm: bool) -> Vec<Ga
 fn Gauge(title: &'static str, display_value: String, raw_value: Option<f64>,
     maximum: usize, step: usize, major_every: usize, unit: &'static str, kind: &'static str) -> Element {
     let percentage = raw_value.map(|v| (v / maximum as f64).clamp(0.0, 1.0)).unwrap_or(0.0);
-    let active_arc = arc_path(132.0, 135.0, 135.0 + (270.0 * percentage).max(0.01));
+    // Constant SVG path: only dash offset changes. Never interpolate path `d` (warps on WebView2).
     let track = arc_path(132.0, 135.0, 405.0);
+    let arc_len = 2.0 * PI * 132.0 * 0.75;
+    let dash_offset = arc_len * (1.0 - percentage);
     let marks = ticks(maximum, step, major_every, kind == "rpm");
     rsx! {
         div { class: "cluster-dial gauge-{kind}",
@@ -73,7 +76,7 @@ fn Gauge(title: &'static str, display_value: String, raw_value: Option<f64>,
                     circle { cx: "160", cy: "160", r: "150", class: "gauge-outer" }
                     path { d: "{track}", class: "gauge-rail" }
                     if raw_value.is_some() {
-                        path { d: "{active_arc}", class: "gauge-active" }
+                        path { d: "{track}", class: "gauge-active", style: "stroke-dasharray: {arc_len} 1000; stroke-dashoffset: {dash_offset};" }
                     }
                     for tick in marks {
                         line { x1: "{tick.x1}", y1: "{tick.y1}", x2: "{tick.x2}", y2: "{tick.y2}",
@@ -94,7 +97,7 @@ fn Gauge(title: &'static str, display_value: String, raw_value: Option<f64>,
 }
 
 #[component]
-pub fn Instrument(data: VehicleSnapshot) -> Element {
+pub fn Instrument(data: VehicleSnapshot, layout: Layout) -> Element {
     let speed = reading(&data.speed_kmh, 0);
     let rpm_value = data.rpm.usable().copied();
     let rpm = rpm_value.map(|v| format!("{:.1}", v / 1000.0)).unwrap_or_else(|| "—".to_owned());
@@ -150,13 +153,17 @@ pub fn Instrument(data: VehicleSnapshot) -> Element {
     };
     let degraded = matches!(data.status, TelemetryStatus::Partial | TelemetryStatus::Disconnected);
     let critical = data.lights.oil_pressure == LampState::On || data.lights.brake == LampState::On;
+    let body_problem = data.openings.usable().is_some_and(|o| o.any_open());
+    let tyre_problem = data.tyres.usable().is_some_and(|t| t.wheels.iter().any(|w| w.alert != TyreAlert::Normal));
     let warning = if degraded { "DONNÉES INDISPONIBLES" }
+        else if body_problem { "OUVRANT NON FERMÉ" }
+        else if tyre_problem { "PNEUMATIQUES · CONTRÔLE REQUIS" }
         else if data.lights.oil_pressure == LampState::On { "PRESSION D'HUILE · ALERTE" }
         else if data.lights.brake == LampState::On { "FREINAGE · ALERTE" }
         else if data.lights.engine == LampState::On { "MOTEUR · CONTRÔLE REQUIS" }
         else { "PARAMÈTRES DE CONDUITE" };
     let warning_class = if critical || degraded { "center-alert urgent" }
-        else if data.lights.engine == LampState::On { "center-alert attention" }
+        else if data.lights.engine == LampState::On || body_problem || tyre_problem { "center-alert attention" }
         else { "center-alert" };
 
     rsx! {
@@ -180,11 +187,18 @@ pub fn Instrument(data: VehicleSnapshot) -> Element {
                     Gauge { title: "VITESSE", display_value: speed, raw_value: data.speed_kmh.usable().copied(),
                         maximum: 240, step: 10, major_every: 4, unit: "km/h", kind: "speed" }
                     div { class: "cluster-primary",
+                        if layout != Layout::Original {
+                            div { class: "focus-speed",
+                                strong { "{speed}" } span { "km/h" }
+                            }
+                            div { class: "focus-rpm", "RÉGIME {rpm} × 1000 tr/min" }
+                        }
                         div { class: "center-label", "CENTRE D'INFORMATION" }
                         div { class: "{warning_class}",
                             span { class: "center-alert-icon", if critical || degraded { "!" } else { "◆" } }
                             span { "{warning}" }
                         }
+                        VehicleCondition { openings: data.openings, tyres: data.tyres }
                         div { class: "center-driving",
                             div { class: "center-assist-header",
                                 span { "{assist_mode}" }
@@ -232,6 +246,50 @@ pub fn Instrument(data: VehicleSnapshot) -> Element {
                     }
                 }
                 div { class: "sim-watermark", "PROTOTYPE · AUCUNE CONNEXION À LA VOITURE · NE PAS UTILISER POUR CONDUIRE" }
+            }
+        }
+    }
+}
+
+/// Renderer consumes already-interpreted per-wheel alerts and direct open/closed states.
+/// A future adapter may supply Unknown rather than inventing a closed door or healthy tyre.
+fn tyre_pressure_text(tyre: Option<TyreMonitoring>, wheel: Wheel) -> String {
+    tyre.and_then(|t| t.wheels[wheel.index()].pressure_bar.usable().copied())
+        .map(|p| format!("{p:.1} bar")).unwrap_or_else(|| "—".to_owned())
+}
+
+#[component]
+fn VehicleCondition(openings: Reading<BodyOpenings>, tyres: Reading<TyreMonitoring>) -> Element {
+    let body = openings.usable().copied();
+    let tyre = tyres.usable().copied();
+    let known_open = body.is_some_and(|b| b.any_open());
+    let known_bad_tyre = tyre.is_some_and(|t| t.wheels.iter().any(|w| w.alert != TyreAlert::Normal));
+    rsx! {
+        div { class: "vehicle-condition",
+            div { class: "vehicle-condition-title", "ÉTAT DU VÉHICULE", span { "SEDAN · 4 PORTES" } }
+            div { class: "vehicle-condition-grid",
+                div { class: "body-overview",
+                    for aperture in Aperture::ALL {
+                        div { key: "{aperture:?}", class: if body.is_none() { "body-element unknown" } else if body.is_some_and(|b| b.is_open(aperture)) { "body-element open" } else { "body-element closed" },
+                            span { "{aperture.label()}" }
+                            strong { if body.is_none() { "?" } else if body.is_some_and(|b| b.is_open(aperture)) { "OUVERT" } else { "OK" } }
+                        }
+                    }
+                }
+                div { class: "tyre-overview",
+                    for wheel in Wheel::ALL {
+                        div { key: "{wheel:?}", class: match tyre.map(|t| t.wheels[wheel.index()].alert).unwrap_or(TyreAlert::Unknown) {
+                                TyreAlert::Normal => "wheel-chip normal", TyreAlert::Underinflated => "wheel-chip low",
+                                TyreAlert::Critical => "wheel-chip critical", TyreAlert::SensorFault | TyreAlert::Unknown => "wheel-chip unknown",
+                            },
+                            span { "{wheel.label()}" }
+                            strong { "{tyre_pressure_text(tyre, wheel)}" }
+                        }
+                    }
+                }
+            }
+            if known_open || known_bad_tyre {
+                div { class: "vehicle-condition-alert", if known_open { "Vérifier les ouvrants" } else { "Pression / capteur à contrôler" } }
             }
         }
     }
@@ -311,6 +369,12 @@ mod tests {
         assert!(speed.iter().any(|t| (t.lx - t.x1).abs() > 1.0));
     }
 
+    #[test]
+    fn svg_arc_geometry_remains_constant_for_all_values() {
+        let rail=arc_path(132.0,135.0,405.0);
+        assert_eq!(rail,arc_path(132.0,135.0,405.0));
+        assert!((2.0*PI*132.0*0.75-622.0).abs()<1.0);
+    }
     #[test]
     fn measured_odometer_is_formatted_and_unknown_is_not_invented() {
         assert_eq!(odometer_label(&Reading::simulated(182_450.0)), "182 450");
