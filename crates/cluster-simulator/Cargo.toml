@@ -1,0 +1,8 @@
+[package]
+name = "cluster-simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cluster-core = { path = "../cluster-core" }
