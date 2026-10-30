@@ -158,7 +158,7 @@ fn Telltale(name: &'static str, state: LampState, tone: &'static str, #[props(de
     };
     rsx! {
         div { class: "{class} {tone} {state_class}", title: "{name}",
-            svg { viewBox: "0 0 48 48", width: "34", height: "34", fill: "none", stroke: "currentColor", "stroke-width": "2.7", "stroke-linecap": "round", "stroke-linejoin": "round",
+            svg { view_box: "0 0 48 48", width: "34", height: "34", fill: "none", stroke: "currentColor", "stroke-width": "2.7", "stroke-linecap": "round", "stroke-linejoin": "round",
                 if name == "left" { path { d: "M37 15 H21 V8 L6 24 L21 40 V32 H37 Z", fill: "currentColor", stroke: "none" } }
                 if name == "right" { path { d: "M11 15 H27 V8 L42 24 L27 40 V32 H11 Z", fill: "currentColor", stroke: "none" } }
                 if name == "engine" {
