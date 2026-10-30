@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cluster-core",
+    "crates/cluster-simulator",
+    "crates/cluster-app",
+]
+default-members = ["crates/cluster-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+strip = true
