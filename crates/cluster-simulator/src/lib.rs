@@ -187,9 +187,10 @@ impl Simulator {
         if (gear == Gear::Reverse || self.gear == Gear::Reverse) && self.speed_kmh > 2.0 { return; }
         if self.gear != gear {
             self.gear = gear;
-            if self.assistance.mode == AssistanceMode::Cruise { self.interrupt(InterruptionReason::Clutch); }
             if gear == Gear::Neutral || gear == Gear::Reverse {
                 self.interrupt(InterruptionReason::Neutral);
+            } else if self.assistance.mode == AssistanceMode::Cruise {
+                self.interrupt(InterruptionReason::Clutch);
             }
         }
     }
