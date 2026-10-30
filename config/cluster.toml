@@ -1,0 +1,10 @@
+# Phase 1: simulation only. "fullscreen" controls STARTUP mode.
+# Windowed by default, so the developer can use other applications alongside.
+[window]
+fullscreen = false
+width = 1360
+height = 840
+
+[interface]
+theme = "rs"       # rs | classic | ice
+tick_ms = 50      # simulated telemetry refresh (16..250 ms)
