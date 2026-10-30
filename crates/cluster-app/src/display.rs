@@ -69,7 +69,7 @@ fn Gauge(title: &'static str, display_value: String, raw_value: Option<f64>,
     rsx! {
         div { class: "cluster-dial gauge-{kind}",
             div { class: "gauge-stage",
-                svg { class: "gauge-svg", view_box: "0 0 320 320", role: "img", aria_label: "Graduations de {title}",
+                svg { class: "gauge-svg", view_box: "0 0 320 320", role: "img",
                     circle { cx: "160", cy: "160", r: "150", class: "gauge-outer" }
                     path { d: "{track}", class: "gauge-rail" }
                     if raw_value.is_some() {
