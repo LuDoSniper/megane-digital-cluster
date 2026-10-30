@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.dx/
+**/*.rs.bk
+*.log
+.DS_Store
+.vscode/
+.idea/
