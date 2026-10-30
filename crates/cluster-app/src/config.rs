@@ -34,11 +34,12 @@ impl Default for WindowConfig {
 pub struct InterfaceConfig {
     pub theme: Theme,
     pub tick_ms: u64,
+    pub show_lab_on_start: bool,
 }
 
 impl Default for InterfaceConfig {
     fn default() -> Self {
-        Self { theme: Theme::Rs, tick_ms: 50 }
+        Self { theme: Theme::Rs, tick_ms: 50, show_lab_on_start: false }
     }
 }
 

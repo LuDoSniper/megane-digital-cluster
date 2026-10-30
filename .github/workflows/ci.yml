@@ -10,24 +10,38 @@ on:
 permissions:
   contents: read
 
+# No duplicated full release builds for superseded commits on the same branch.
+concurrency:
+  group: cluster-win-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      # Cached registry + compiled dependencies (debug/release independently).
+      # Test and build both use release profile, so dependencies compile once.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: .
+          shared-key: cluster-win-release
+          workspaces: ". -> target"
           cache-on-failure: true
-      - name: Format
+          cache-all-crates: true
+          cache-workspace-crates: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format sources before build
         run: cargo fmt --all
-      - name: Unit tests
-        run: cargo test --workspace
-      - name: Build desktop (release)
+      - name: Unit tests (release profile)
+        run: cargo test --release --workspace
+      - name: Build Windows desktop (release)
         run: cargo build --release -p cluster-app
       - name: Package portable Windows
         shell: pwsh

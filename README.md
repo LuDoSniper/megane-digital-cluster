@@ -4,16 +4,44 @@ Combiné numérique **expérimental** pour une Renault Mégane II Sedan / Classi
 
 **Phase 1 : application PC Rust + Dioxus avec télémétrie totalement simulée.** Le programme ne se connecte pas à la voiture et n'en remplace aucun instrument. [Lire l'avis de sécurité](docs/NOTICE_SECURITE.md).
 
-## Fonctionnalités disponibles
+## V0.2 — Combiné routier et laboratoire séparés
 
-- Compteur numérique de vitesse, compte-tours animé et affichage du rapport de boîte.
-- Carburant, température, tension, trajet et kilométrage **fictif**.
-- 10 témoins (moteur, huile, batterie, ABS, airbag, frein, ceinture, clignotants, phares).
-- Variantes visuelles RS, Classique et Glacier.
-- Simulateur interactif : accélérateur, frein, boîte 5, arrêt/démarrage moteur, pause, remise à zéro.
-- Scénarios : conduite normale, démarrage à froid, défaut moteur, capteurs absents, perte de liaison.
-- Architecture `TelemetrySource` lecture seule pour préparer une future source OBD-II sans modifier les composants UI.
-- Dégradation contrôlée : `—` pour donnée absente/périmée, `?` pour témoin dont l'état est inconnu.
+L'application démarre sur **le véritable aperçu de combiné** : cadrans, vitesse centrale,
+rapport, suggestion de changement de rapport, témoins dessinés en SVG, jauges et assistance.
+Le **laboratoire** (commandes de simulation) est masqué par défaut et s'ouvre avec **F2** ou
+« Ouvrir le laboratoire » : la vue du combiné n'embarque aucune commande du simulateur.
+Les deux vues partagent un modèle de télémétrie indépendante des futurs lecteurs OBD.
+
+- Simulation 5 vitesses + neutre + marche arrière **R** (enclenchable sous 2 km/h).
+- Clignotants animés (~90/min) et feux de détresse, croisement vert et plein phare bleu.
+- Témoin moteur, huile, batterie, ABS, airbag, frein, ceinture ; valeurs inconnues explicites.
+- Suggestion de rapport ↑/↓ selon régime, purement indicative : **ne pas l'utiliser pour conduire**.
+- Régulateur et limiteur fictifs avec sélection, SET, +/- 1 km/h, annulation et reprise.
+  Régulateur coupé par frein/embrayage simulé lors du changement de rapport ; limiteur
+  avec « kickdown » simulé au-delà de 95 % de pédale. Aucun ordre envoyé au véhicule.
+- Trois thèmes (RS, Classique, Glacier), panne capteurs, perte de données, démarrage à froid.
+
+### Clavier (actif partout sauf dans un champ de saisie)
+
+| Touche | Fonction |
+|---|---|
+| ↑ / ↓ | Accélérateur +5 / −5 % (maintien possible) |
+| → / ← | Frein +5 / −5 % (maintien possible) |
+| Pavé num. 1 à 5 (ou ligne des chiffres) | Sélection du rapport |
+| 0 | Point mort N |
+| R ou « . » du pavé | Marche arrière (à l'arrêt) |
+| Q / E / H | Clignotant gauche / droit / feux de détresse |
+| B / F | Feux de croisement / pleins phares |
+| C / V | Mode régulateur / limiteur (réappuyer : OFF) |
+| Entrée | SET (au moins 30 km/h) |
+| + / − | Ajuster la consigne d'assistance |
+| X / Z | Annuler / reprendre l'assistance |
+| Espace | Pause simulation |
+| F2 / Échap | Ouvrir/fermer le laboratoire |
+
+La simulation volontairement approximative **ne représente pas le comportement réel** de
+la Mégane II (lois de pédale, 5 rapports, couple, freinage, etc.). La marche arrière
+n'est pas une commande électrique à envoyer au véhicule.
 
 ## Démarrage sur PC
 
@@ -44,6 +72,7 @@ height = 840
 [interface]
 theme = "rs"       # rs, classic ou ice
 tick_ms = 50
+show_lab_on_start = false # option laboratoire, distincte du mode plein écran
 ```
 
 Pour lancer directement en plein écran (sans bordure), remplacer **uniquement** `fullscreen = false` par `fullscreen = true`, enregistrer et **redémarrer l'application**. À `false`, la fenêtre reste redimensionnable et comporte les contrôles natifs de fermeture/minimisation.
@@ -52,7 +81,7 @@ Pour un fichier alternatif, définir `CLUSTER_CONFIG` sur son chemin absolu. Sur
 
 ### Tester rapidement les scénarios
 
-1. Modifier la valeur d'accélérateur ou de frein, et passer les rapports `−` / `+`.
+1. Ouvrir le laboratoire (`F2`) ou utiliser le clavier pour piloter le simulateur.
 2. Activer un témoin pour vérifier sa couleur ; il s'agit de faux voyants.
 3. Choisir « Capteurs indisponibles » : vitesse, régime et température affichent `—`.
 4. Choisir « Connexion perdue » : valeurs périmées masquées et témoins marqués `?`.
@@ -66,7 +95,7 @@ cargo test --workspace
 cargo build --release -p cluster-app
 ```
 
-À chaque push sur `main` et à chaque PR, GitHub Actions effectue les tests sous Windows, compile en release et fournit un artefact **`megane-digital-cluster-windows-<sha>`** (exécutable + configuration). Téléchargement depuis l'onglet **Actions** du dépôt.
+À chaque push sur `main` et à chaque PR, GitHub Actions utilise **Swatinem/rust-cache** pour garder le registre Cargo et les dépendances compilées, fait les tests **en release** pour partager les builds avec l’exécutable, annule les runs obsolètes sur la même branche et compile en release et fournit un artefact **`megane-digital-cluster-windows-<sha>`** (exécutable + configuration). Téléchargement depuis l'onglet **Actions** du dépôt.
 
 ## Structure
 
@@ -82,3 +111,14 @@ docs/                      architecture et consignes de sécurité
 [Architecture et prochaines phases](docs/ARCHITECTURE.md).
 
 > **Attention :** la vitesse, les voyants et le kilométrage ne sont pas des informations réelles. Ne pas utiliser cette application pour conduire ou en remplacement du compteur d'origine.
+
+### Références pour l'iconographie (prototype, sans homologation)
+
+Les couleurs fonctionnelles du prototype s'appuient sur les conventions de
+[ISO 2575:2021](https://www.iso.org/standard/68409.html) (vert clignotants/feux de croisement,
+bleu feux de route, ambre défaillances, rouge danger). Les **formes SVG sont des
+approximations originales**, pas une reproduction officielle du catalogue ISO ni
+une validation d'homologation. Certaines fonctions dépendent de l'équipement réel
+et doivent être vérifiées sur la voiture. La logique du régulateur/limiteur simulé
+est guidée par la [documentation technique de la Mégane II](https://manualzz.com/doc/53328114/renault-megane-ii-manuel-utilisateur),
+**sans aucune prétention de représenter fidèlement les calculateurs Renault**.

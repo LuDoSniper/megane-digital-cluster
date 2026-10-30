@@ -7,4 +7,5 @@ height = 840
 
 [interface]
 theme = "rs"       # rs | classic | ice
-tick_ms = 50      # simulated telemetry refresh (16..250 ms)
+tick_ms = 50
+show_lab_on_start = false # true pour ouvrir le laboratoire au lancement      # simulated telemetry refresh (16..250 ms)

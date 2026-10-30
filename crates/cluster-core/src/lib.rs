@@ -68,7 +68,7 @@ impl Gear {
         match self {
             Self::Fifth => Self::Fourth, Self::Fourth => Self::Third,
             Self::Third => Self::Second, Self::Second => Self::First,
-            Self::First => Self::Neutral, Self::Neutral => Self::Neutral, Self::Reverse => Self::Reverse,
+            Self::First => Self::Neutral, Self::Neutral => Self::Reverse, Self::Reverse => Self::Reverse,
         }
     }
 
@@ -92,6 +92,7 @@ pub struct WarningLights {
     pub left_indicator: LampState,
     pub right_indicator: LampState,
     pub main_beam: LampState,
+    pub dipped_beam: LampState,
 }
 
 impl WarningLights {
@@ -102,7 +103,52 @@ impl WarningLights {
             airbag: LampState::Unknown, brake: LampState::Unknown,
             seatbelt: LampState::Unknown, left_indicator: LampState::Unknown,
             right_indicator: LampState::Unknown, main_beam: LampState::Unknown,
+            dipped_beam: LampState::Unknown,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssistanceMode { Off, Cruise, Limiter }
+
+impl AssistanceMode {
+    pub fn label(self) -> &'static str {
+        match self { Self::Off => "OFF", Self::Cruise => "RÉGULATEUR", Self::Limiter => "LIMITEUR" }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeedAssistance {
+    pub mode: AssistanceMode,
+    /// Setpoint is a simulation value, not an ECU control state.
+    pub setpoint_kmh: Option<f64>,
+    pub active: bool,
+    pub temporarily_overridden: bool,
+}
+
+impl Default for SpeedAssistance {
+    fn default() -> Self {
+        Self { mode: AssistanceMode::Off, setpoint_kmh: None, active: false, temporarily_overridden: false }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftAdvice { None, Up, Down }
+
+/// Illustrative eco shift cue: never a manufacturer-approved driving recommendation.
+pub fn suggested_shift(gear: Gear, rpm: Option<f64>, running: bool) -> ShiftAdvice {
+    if !running { return ShiftAdvice::None; }
+    let Some(rpm) = rpm else { return ShiftAdvice::None; };
+    if !rpm.is_finite() { return ShiftAdvice::None; }
+    match gear {
+        Gear::Reverse | Gear::Neutral => ShiftAdvice::None,
+        Gear::Fifth if rpm < 1300.0 => ShiftAdvice::Down,
+        Gear::Fifth => ShiftAdvice::None,
+        Gear::First if rpm > 3100.0 => ShiftAdvice::Up,
+        Gear::First => ShiftAdvice::None,
+        _ if rpm > 3000.0 => ShiftAdvice::Up,
+        _ if rpm < 1300.0 => ShiftAdvice::Down,
+        _ => ShiftAdvice::None,
     }
 }
 
@@ -118,6 +164,7 @@ pub struct VehicleSnapshot {
     pub simulated_odometer_km: Reading<f64>,
     pub gear: Gear,
     pub engine_running: bool,
+    pub assistance: SpeedAssistance,
     pub lights: WarningLights,
     pub elapsed_simulation_s: f64,
 }
@@ -129,7 +176,8 @@ impl Default for VehicleSnapshot {
             coolant_c: Reading::unknown(), fuel_pct: Reading::unknown(),
             battery_v: Reading::unknown(), trip_km: Reading::unknown(),
             simulated_odometer_km: Reading::unknown(), gear: Gear::Neutral,
-            engine_running: false, lights: WarningLights::unknown(), elapsed_simulation_s: 0.0,
+            engine_running: false, assistance: SpeedAssistance::default(),
+            lights: WarningLights::unknown(), elapsed_simulation_s: 0.0,
         }
     }
 }
@@ -158,8 +206,17 @@ mod tests {
     }
 
     #[test]
+    fn shift_advice_only_for_valid_forward_gears() {
+        assert_eq!(suggested_shift(Gear::Third, Some(3500.0), true), ShiftAdvice::Up);
+        assert_eq!(suggested_shift(Gear::Third, Some(1050.0), true), ShiftAdvice::Down);
+        assert_eq!(suggested_shift(Gear::Neutral, Some(4000.0), true), ShiftAdvice::None);
+        assert_eq!(suggested_shift(Gear::Fifth, None, true), ShiftAdvice::None);
+        assert_eq!(suggested_shift(Gear::Second, Some(5000.0), false), ShiftAdvice::None);
+    }
+
+    #[test]
     fn gear_limits_are_respected() {
         assert_eq!(Gear::Fifth.higher(), Gear::Fifth);
-        assert_eq!(Gear::Neutral.lower(), Gear::Neutral);
+        assert_eq!(Gear::Neutral.lower(), Gear::Reverse);
     }
 }

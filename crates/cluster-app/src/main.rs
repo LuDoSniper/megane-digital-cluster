@@ -1,11 +1,13 @@
 mod config;
+mod display;
 
-use cluster_core::{DataQuality, LampState, Reading, TelemetrySource, VehicleSnapshot};
+use cluster_core::{AssistanceMode, Gear, TelemetrySource, VehicleSnapshot};
 use cluster_simulator::{Command, Lamp, Scenario, Simulator};
 use config::{AppConfig, Theme};
+use display::Instrument;
 use dioxus::prelude::*;
-use dioxus_desktop::{Config as DesktopConfig, LogicalSize, WindowBuilder};
 use dioxus_desktop::tao::window::Fullscreen;
+use dioxus_desktop::{Config as DesktopConfig, LogicalSize, WindowBuilder};
 use std::time::{Duration, Instant};
 
 const CSS: &str = include_str!("../assets/main.css");
@@ -13,7 +15,7 @@ const CSS: &str = include_str!("../assets/main.css");
 fn main() {
     let config = AppConfig::load();
     let mut window = WindowBuilder::new()
-        .with_title("Mégane Digital Cluster — Prototype")
+        .with_title("Mégane Digital Cluster — Simulateur")
         .with_inner_size(LogicalSize::new(config.window.width as f64, config.window.height as f64))
         .with_min_inner_size(LogicalSize::new(960.0, 600.0))
         .with_resizable(true);
@@ -28,20 +30,41 @@ fn main() {
 
 fn dispatch(mut sim: Signal<Simulator>, mut reading: Signal<VehicleSnapshot>, command: Command) {
     sim.write().apply(command);
-    let updated = sim.read().snapshot();
-    reading.set(updated);
+    reading.set(sim.read().snapshot());
 }
 
-fn display(value: &Reading<f64>, digits: usize) -> String {
-    value.usable().map(|v| format!("{v:.digits$}")).unwrap_or_else(|| "—".to_owned())
-}
-
-fn lamp_class(state: LampState, tone: &str) -> String {
-    match state {
-        LampState::On => format!("lamp lamp-{tone} lamp-active"),
-        LampState::Off => "lamp".to_owned(),
-        LampState::Unknown => "lamp lamp-unknown".to_owned(),
-    }
+fn handle_shortcut(code: &str, sim: Signal<Simulator>, reading: Signal<VehicleSnapshot>, mut show_lab: Signal<bool>) {
+    let state = sim.read().clone();
+    let command = match code {
+        "ArrowUp" => Some(Command::Accelerator(state.accelerator_pct + 5.0)),
+        "ArrowDown" => Some(Command::Accelerator(state.accelerator_pct - 5.0)),
+        "ArrowRight" => Some(Command::Brake(state.brake_pct + 5.0)),
+        "ArrowLeft" => Some(Command::Brake(state.brake_pct - 5.0)),
+        "Digit0" | "Numpad0" => Some(Command::SetGear(Gear::Neutral)),
+        "Digit1" | "Numpad1" => Some(Command::SetGear(Gear::First)),
+        "Digit2" | "Numpad2" => Some(Command::SetGear(Gear::Second)),
+        "Digit3" | "Numpad3" => Some(Command::SetGear(Gear::Third)),
+        "Digit4" | "Numpad4" => Some(Command::SetGear(Gear::Fourth)),
+        "Digit5" | "Numpad5" => Some(Command::SetGear(Gear::Fifth)),
+        "KeyR" | "NumpadDecimal" => Some(Command::SetGear(Gear::Reverse)),
+        "KeyQ" => Some(Command::ToggleLamp(Lamp::Left)),
+        "KeyE" => Some(Command::ToggleLamp(Lamp::Right)),
+        "KeyH" => Some(Command::ToggleHazards),
+        "KeyB" => Some(Command::ToggleLamp(Lamp::Dipped)),
+        "KeyF" => Some(Command::ToggleLamp(Lamp::Beam)),
+        "KeyC" => Some(Command::SetAssistance(if state.assistance.mode == AssistanceMode::Cruise { AssistanceMode::Off } else { AssistanceMode::Cruise })),
+        "KeyV" => Some(Command::SetAssistance(if state.assistance.mode == AssistanceMode::Limiter { AssistanceMode::Off } else { AssistanceMode::Limiter })),
+        "Enter" | "NumpadEnter" => Some(Command::SetAssistanceSpeed),
+        "NumpadAdd" | "Equal" => Some(Command::AdjustAssistance(1.0)),
+        "NumpadSubtract" | "Minus" => Some(Command::AdjustAssistance(-1.0)),
+        "KeyX" => Some(Command::CancelAssistance),
+        "KeyZ" => Some(Command::ResumeAssistance),
+        "Space" => Some(Command::Pause),
+        "F2" => { show_lab.set(!show_lab()); None }
+        "Escape" => { show_lab.set(false); None }
+        _ => None,
+    };
+    if let Some(command) = command { dispatch(sim, reading, command); }
 }
 
 fn app() -> Element {
@@ -49,6 +72,8 @@ fn app() -> Element {
     let mut sim = use_signal(Simulator::default);
     let mut reading = use_signal(|| Simulator::default().snapshot());
     let mut theme = use_signal(|| config.interface.theme);
+    let mut show_lab = use_signal(|| config.interface.show_lab_on_start);
+    let mut show_help = use_signal(|| false);
     let tick_ms = config.interface.tick_ms;
 
     use_future(move || async move {
@@ -63,229 +88,175 @@ fn app() -> Element {
         }
     });
 
+    // Global shortcuts, including when the developer panel does not have focus.
+    // Ignore text entry and modifier combinations. All interactions are simulator-only.
+    use_future(move || async move {
+        let mut eval = document::eval(r#"
+            const keys = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
+              'Digit0','Digit1','Digit2','Digit3','Digit4','Digit5',
+              'Numpad0','Numpad1','Numpad2','Numpad3','Numpad4','Numpad5',
+              'NumpadDecimal','NumpadEnter','NumpadAdd','NumpadSubtract',
+              'KeyR','KeyQ','KeyE','KeyH','KeyB','KeyF','KeyC','KeyV',
+              'KeyX','KeyZ','Space','Enter','Equal','Minus','F2','Escape']);
+            const repeating = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','NumpadAdd','NumpadSubtract','Equal','Minus']);
+            const handler = (event) => {
+              if (!keys.has(event.code) || event.altKey || event.ctrlKey || event.metaKey) return;
+              const target = event.target;
+              if (target && (['INPUT','SELECT','TEXTAREA'].includes(target.tagName) || target.isContentEditable)) return;
+              event.preventDefault();
+              if (event.repeat && !repeating.has(event.code)) return;
+              dioxus.send(event.code);
+            };
+            window.addEventListener('keydown', handler);
+            await new Promise(() => {});
+        "#);
+        while let Ok(code) = eval.recv::<String>().await {
+            handle_shortcut(&code, sim, reading, show_lab);
+        }
+    });
+
     let state = sim.read().clone();
     let data = reading.read().clone();
     let current_theme = theme();
     let theme_class = current_theme.class();
-    let speed = display(&data.speed_kmh, 0);
-    let rpm = display(&data.rpm, 0);
-    let rpm_sweep = data.rpm.usable().map(|v| (v / 7000.0 * 270.0).clamp(0.0, 270.0)).unwrap_or(0.0);
-    let rpm_percentage = data.rpm.usable().map(|v| (v / 7000.0 * 100.0).clamp(0.0, 100.0)).unwrap_or(0.0);
-    let rpm_zone = if data.rpm.usable().is_some_and(|v| *v >= 6000.0) { "rpm-alert" } else { "" };
-    let signal_text = if state.scenario == Scenario::SensorFailure { "CAPTEUR INDISPONIBLE" }
+    let status = if state.scenario == Scenario::SensorFailure { "CAPTEUR ABSENT" }
         else if state.scenario == Scenario::LinkLost { "LIAISON PERDUE" }
-        else if state.paused { "SIMULATION EN PAUSE" } else { "TÉLÉMÉTRIE SIMULÉE" };
-    let connection_class = if state.scenario == Scenario::LinkLost || state.scenario == Scenario::SensorFailure { "status-bad" } else { "status-good" };
-    let fuel = data.fuel_pct.usable().copied().unwrap_or(0.0).clamp(0.0, 100.0);
-    let coolant = display(&data.coolant_c, 0);
-    let battery = display(&data.battery_v, 1);
-    let trip = display(&data.trip_km, 1);
-    let odometer = display(&data.simulated_odometer_km, 1);
-    let speed_quality = match data.speed_kmh.quality {
-        DataQuality::Simulated => "SIM", DataQuality::Unknown => "INCONNU", DataQuality::Stale => "PÉRIMÉ",
-    };
+        else if state.paused { "PAUSE" } else { "SIMULATION" };
+    let lab_class = if show_lab() { "lab-open" } else { "lab-closed" };
 
     rsx! {
         document::Style { "{CSS}" }
-        div { class: "app-shell {theme_class}",
-            header { class: "app-header",
-                div { class: "brand",
-                    span { class: "brand-icon", "M" }
-                    div {
-                        strong { "MÉGANE" }
-                        small { "DIGITAL CLUSTER / LAB 01" }
-                    }
-                }
-                div { class: "header-middle",
-                    span { class: "live-dot" }
-                    "MODE SIMULATION · PHASE 1"
-                }
-                div { class: "theme-controls",
-                    span { "THÈME" }
-                    for choice in [Theme::Rs, Theme::Classic, Theme::Ice] {
-                        button {
-                            key: "{choice:?}",
-                            class: if current_theme == choice { "theme-button selected" } else { "theme-button" },
-                            onclick: move |_| theme.set(choice),
-                            "{choice.label()}"
-                        }
+        div { class: "app-shell {theme_class} {lab_class}",
+            div { class: "view-toolbar",
+                div { class: "view-title", span { class: "view-emblem", "◇" } span { "MÉGANE DIGITAL CLUSTER" } }
+                div { class: "view-tools",
+                    button { class: "subtle-control", onclick: move |_| show_help.set(!show_help()), "⌨ Raccourcis" }
+                    button { class: "subtle-control lab-action", onclick: move |_| show_lab.set(!show_lab()),
+                        if show_lab() { "✕ Masquer le laboratoire" } else { "⚙ Ouvrir le laboratoire · F2" }
                     }
                 }
             }
-            main { class: "workspace",
-                section { class: "instrument-panel",
-                    div { class: "instrument-heading",
-                        div {
-                            span { class: "eyebrow", "INSTRUMENTATION" }
-                            h1 { "Tableau de bord" }
+            if show_help() {
+                div { class: "shortcut-help",
+                    button { class: "help-close", onclick: move |_| show_help.set(false), "✕" }
+                    strong { "RACCOURCIS SIMULATEUR" }
+                    p { "↑ ↓ : accélérateur ± 5 % · ← → : frein ± 5 % · Pavé numérique 1–5 : rapport · 0 : point mort · R ou . pavé : marche arrière (à l'arrêt)." }
+                    p { "Q / E : clignotants · H : détresse · B : feux de croisement · F : pleins phares · C : régulateur · V : limiteur." }
+                    p { "Entrée : mémoriser vitesse (≥ 30 km/h) · + / − : consigne · X : annuler · Z : reprendre · Espace : pause · F2 : labo · Échap : fermer." }
+                }
+            }
+            main { class: "instrument-workspace",
+                Instrument { data: data.clone(), status: status.to_string() }
+                if show_lab() {
+                    aside { class: "control-panel",
+                        div { class: "aside-header",
+                            div { span { class: "eyebrow", "LABORATOIRE / PHASE 1" } h2 { "Simulation" } }
+                            span { class: "tag", "OFFLINE" }
                         }
-                        div { class: "connection {connection_class}",
-                            span { class: "connection-dot" }
-                            "{signal_text}"
+                        div { class: "control-section",
+                            span { class: "field-label", "MOTEUR ET SCÉNARIOS" }
+                            div { class: "button-group",
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::ToggleEngine),
+                                    if state.engine_running { "Arrêter" } else { "Démarrer" }
+                                }
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::Pause),
+                                    if state.paused { "Reprendre" } else { "Pause" }
+                                }
+                            }
+                            select {
+                                value: "{state.scenario.label()}",
+                                onchange: move |event| {
+                                    let selected = event.value();
+                                    if let Some(sc) = Scenario::ALL.into_iter().find(|s| s.label() == selected) {
+                                        dispatch(sim, reading, Command::SetScenario(sc));
+                                    }
+                                },
+                                for scenario in Scenario::ALL {
+                                    option { key: "{scenario:?}", value: "{scenario.label()}", "{scenario.label()}" }
+                                }
+                            }
                         }
-                    }
-                    div { class: "cockpit",
-                        div { class: "cockpit-top",
-                            div { class: "top-left",
-                                span { class: "eyebrow", "RENAULT MÉGANE II · 1.6 16V" }
-                                span { class: "vehicle-type", "SEDAN / 2004" }
+                        div { class: "control-section",
+                            div { class: "range-header", span { class: "field-label", "ACCÉLÉRATEUR" } strong { "{state.accelerator_pct:.0}%" } }
+                            input { r#type: "range", min: "0", max: "100", step: "1", value: "{state.accelerator_pct:.0}",
+                                oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::Accelerator(v)); }
                             }
-                            div { class: "gear-status",
-                                span { "RAPPORT" }
-                                strong { "{data.gear.label()}" }
+                            div { class: "range-header", span { class: "field-label", "FREIN" } strong { "{state.brake_pct:.0}%" } }
+                            input { r#type: "range", min: "0", max: "100", step: "1", value: "{state.brake_pct:.0}",
+                                oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::Brake(v)); }
                             }
-                            div { class: "engine-state", if data.engine_running { "MOTEUR EN MARCHE" } else { "MOTEUR ARRÊTÉ" } }
                         }
-                        div { class: "gauges",
-                            div { class: "speed-area",
-                                span { class: "gauge-label", "VITESSE" }
-                                div { class: "speed-value", "{speed}" }
-                                span { class: "speed-unit", "km/h" }
-                                div { class: "speed-baseline" }
-                                span { class: "quality-label", "SOURCE · {speed_quality}" }
-                            }
-                            div { class: "rpm-area",
-                                div {
-                                    class: "rpm-dial {rpm_zone}",
-                                    style: "--rpm-sweep: {rpm_sweep}deg;",
-                                    div { class: "rpm-inner",
-                                        span { class: "gauge-label", "RÉGIME MOTEUR" }
-                                        strong { "{rpm}" }
-                                        span { "tr/min" }
+                        div { class: "control-section",
+                            span { class: "field-label", "BOÎTE MANUELLE · R / N / 1–5" }
+                            div { class: "gear-keys",
+                                for (gear, label) in [(Gear::Reverse,"R"),(Gear::Neutral,"N"),(Gear::First,"1"),(Gear::Second,"2"),(Gear::Third,"3"),(Gear::Fourth,"4"),(Gear::Fifth,"5")] {
+                                    button {
+                                        key: "{label}", class: if state.gear == gear { "gear-key selected" } else { "gear-key" },
+                                        onclick: move |_| dispatch(sim, reading, Command::SetGear(gear)), "{label}"
                                     }
                                 }
-                                div { class: "rpm-ticks", span { "0" } span { "2" } span { "4" } span { "6" } span { "7" } }
+                            }
+                            small { class: "mini-help", "Marche arrière autorisée uniquement sous 2 km/h." }
+                        }
+                        div { class: "control-section",
+                            span { class: "field-label", "ÉCLAIRAGE ET SIGNALISATION" }
+                            div { class: "toggle-grid",
+                                LampToggle { label: "Clign. gauche", lamp: Lamp::Left, active: state.lamp_active(Lamp::Left), sim, reading }
+                                LampToggle { label: "Clign. droite", lamp: Lamp::Right, active: state.lamp_active(Lamp::Right), sim, reading }
+                                button { class: if state.hazards { "lamp-toggle active" } else { "lamp-toggle" }, onclick: move |_| dispatch(sim, reading, Command::ToggleHazards), "Feux de détresse" }
+                                LampToggle { label: "Croisement", lamp: Lamp::Dipped, active: state.lamp_active(Lamp::Dipped), sim, reading }
+                                LampToggle { label: "Pleins phares", lamp: Lamp::Beam, active: state.lamp_active(Lamp::Beam), sim, reading }
                             }
                         }
-                        div { class: "rpm-progress",
-                            div { class: "rpm-progress-fill", style: "width: {rpm_percentage}%;" }
-                        }
-                        div { class: "warnings",
-                            Warning { label: "MOTEUR", state: data.lights.engine, tone: "amber" }
-                            Warning { label: "HUILE", state: data.lights.oil_pressure, tone: "red" }
-                            Warning { label: "BATTERIE", state: data.lights.battery, tone: "red" }
-                            Warning { label: "ABS", state: data.lights.abs, tone: "amber" }
-                            Warning { label: "AIRBAG", state: data.lights.airbag, tone: "red" }
-                            Warning { label: "FREIN", state: data.lights.brake, tone: "red" }
-                            Warning { label: "CEINTURE", state: data.lights.seatbelt, tone: "red" }
-                            Warning { label: "◀", state: data.lights.left_indicator, tone: "green" }
-                            Warning { label: "▶", state: data.lights.right_indicator, tone: "green" }
-                            Warning { label: "PHARES", state: data.lights.main_beam, tone: "blue" }
-                        }
-                        div { class: "telemetry-strip",
-                            Metric { label: "CARBURANT", value: "{display(&data.fuel_pct, 0)}", unit: "%", progress: Some(fuel) }
-                            Metric { label: "TEMP. MOTEUR", value: "{coolant}", unit: "°C" }
-                            Metric { label: "BATTERIE", value: "{battery}", unit: "V" }
-                            Metric { label: "TRAJET SIMULÉ", value: "{trip}", unit: "km" }
-                        }
-                        div { class: "cockpit-foot",
-                            span { "SIMULATION UNIQUEMENT · AUCUNE CONNEXION AU VÉHICULE" }
-                            span { "ODOMÈTRE FICTIF : {odometer} km" }
-                        }
-                    }
-                    div { class: "info-line",
-                        span { class: "info-icon", "i" }
-                        "Les données et voyants sont fictifs. Un signal inconnu est indiqué « ? », jamais comme un voyant éteint."
-                    }
-                }
-                aside { class: "control-panel",
-                    div { class: "aside-header",
-                        div { span { class: "eyebrow", "LABORATOIRE" } h2 { "Simulateur" } }
-                        span { class: "tag", "LIVE" }
-                    }
-                    div { class: "control-section",
-                        span { class: "field-label", "ÉTAT DU MOTEUR" }
-                        div { class: "button-group",
-                            button {
-                                class: if state.engine_running { "action-button danger" } else { "action-button positive" },
-                                onclick: move |_| dispatch(sim, reading, Command::ToggleEngine),
-                                if state.engine_running { "Arrêter le moteur" } else { "Démarrer le moteur" }
-                            }
-                            button { class: "action-button secondary", onclick: move |_| dispatch(sim, reading, Command::Pause),
-                                if state.paused { "Reprendre" } else { "Pause" }
-                            }
-                        }
-                    }
-                    div { class: "control-section",
-                        label { class: "field-label", r#for: "scenario", "SCÉNARIO DE TEST" }
-                        select {
-                            id: "scenario",
-                            value: "{state.scenario.label()}",
-                            onchange: move |event| {
-                                let selected = event.value();
-                                if let Some(sc) = Scenario::ALL.into_iter().find(|s| s.label() == selected) {
-                                    dispatch(sim, reading, Command::SetScenario(sc));
+                        div { class: "control-section",
+                            span { class: "field-label", "RÉGULATEUR / LIMITEUR (SIMULATION)" }
+                            div { class: "assist-controls",
+                                for (mode, label) in [(AssistanceMode::Off,"OFF"),(AssistanceMode::Cruise,"RÉG."),(AssistanceMode::Limiter,"LIM.")] {
+                                    button { key: "{label}", class: if state.assistance.mode == mode { "gear-key selected" } else { "gear-key" },
+                                        onclick: move |_| dispatch(sim, reading, Command::SetAssistance(mode)), "{label}"
+                                    }
                                 }
-                            },
-                            for scenario in Scenario::ALL {
-                                option { key: "{scenario:?}", value: "{scenario.label()}", "{scenario.label()}" }
+                            }
+                            div { class: "button-group",
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::SetAssistanceSpeed), "SET" }
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::ResumeAssistance), "RESUME" }
+                            }
+                            div { class: "assist-controls",
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::AdjustAssistance(-1.0)), "− 1 km/h" }
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::AdjustAssistance(1.0)), "+ 1 km/h" }
+                                button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::CancelAssistance), "CANCEL" }
+                            }
+                            small { class: "mini-help", "Activation ≥ 30 km/h ; frein = annulation du régulateur. Le limiteur accepte un dépassement simulé au-delà de 95 % d'accélérateur." }
+                        }
+                        div { class: "control-section",
+                            span { class: "field-label", "INJECTION DE VOYANTS (SIMULÉS)" }
+                            div { class: "toggle-grid",
+                                LampToggle { label: "Moteur", lamp: Lamp::Engine, active: state.lamp_active(Lamp::Engine), sim, reading }
+                                LampToggle { label: "Huile", lamp: Lamp::Oil, active: state.lamp_active(Lamp::Oil), sim, reading }
+                                LampToggle { label: "Batterie", lamp: Lamp::Battery, active: state.lamp_active(Lamp::Battery), sim, reading }
+                                LampToggle { label: "ABS", lamp: Lamp::Abs, active: state.lamp_active(Lamp::Abs), sim, reading }
+                                LampToggle { label: "Airbag", lamp: Lamp::Airbag, active: state.lamp_active(Lamp::Airbag), sim, reading }
+                                LampToggle { label: "Frein", lamp: Lamp::Brake, active: state.lamp_active(Lamp::Brake), sim, reading }
+                                LampToggle { label: "Ceinture", lamp: Lamp::Seatbelt, active: state.lamp_active(Lamp::Seatbelt), sim, reading }
                             }
                         }
-                    }
-                    div { class: "control-section",
-                        div { class: "range-header", span { class: "field-label", "ACCÉLÉRATEUR" } strong { "{state.accelerator_pct:.0}%" } }
-                        input { r#type: "range", min: "0", max: "100", step: "1",
-                            value: "{state.accelerator_pct:.0}",
-                            oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::Accelerator(v)); }
+                        div { class: "control-section",
+                            span { class: "field-label", "AFFICHAGE" }
+                            div { class: "theme-controls",
+                                for choice in [Theme::Rs, Theme::Classic, Theme::Ice] {
+                                    button { key: "{choice:?}", class: if current_theme == choice { "theme-button selected" } else { "theme-button" },
+                                        onclick: move |_| theme.set(choice), "{choice.label()}" }
+                                }
+                            }
                         }
-                        div { class: "range-header", span { class: "field-label", "FREIN" } strong { "{state.brake_pct:.0}%" } }
-                        input { r#type: "range", min: "0", max: "100", step: "1",
-                            value: "{state.brake_pct:.0}",
-                            oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::Brake(v)); }
+                        div { class: "control-footer",
+                            button { class: "reset-button", onclick: move |_| dispatch(sim, reading, Command::ResetTrip), "RAZ trajet" }
+                            button { class: "reset-button", onclick: move |_| dispatch(sim, reading, Command::ResetAll), "Réinitialiser simulation" }
                         }
-                    }
-                    div { class: "control-section",
-                        span { class: "field-label", "BOÎTE MANUELLE" }
-                        div { class: "shift-row",
-                            button { class: "shift-button", onclick: move |_| dispatch(sim, reading, Command::ShiftDown), "−" }
-                            div { class: "shift-value", "{state.gear.label()}" }
-                            button { class: "shift-button", onclick: move |_| dispatch(sim, reading, Command::ShiftUp), "+" }
-                        }
-                    }
-                    div { class: "control-section",
-                        span { class: "field-label", "ACTIVER LES TÉMOINS" }
-                        div { class: "toggle-grid",
-                            LampToggle { label: "Moteur", lamp: Lamp::Engine, active: state.lamp_active(Lamp::Engine), sim, reading }
-                            LampToggle { label: "Huile", lamp: Lamp::Oil, active: state.lamp_active(Lamp::Oil), sim, reading }
-                            LampToggle { label: "Batterie", lamp: Lamp::Battery, active: state.lamp_active(Lamp::Battery), sim, reading }
-                            LampToggle { label: "ABS", lamp: Lamp::Abs, active: state.lamp_active(Lamp::Abs), sim, reading }
-                            LampToggle { label: "Airbag", lamp: Lamp::Airbag, active: state.lamp_active(Lamp::Airbag), sim, reading }
-                            LampToggle { label: "Frein", lamp: Lamp::Brake, active: state.lamp_active(Lamp::Brake), sim, reading }
-                            LampToggle { label: "Ceinture", lamp: Lamp::Seatbelt, active: state.lamp_active(Lamp::Seatbelt), sim, reading }
-                            LampToggle { label: "Clign. G", lamp: Lamp::Left, active: state.lamp_active(Lamp::Left), sim, reading }
-                            LampToggle { label: "Clign. D", lamp: Lamp::Right, active: state.lamp_active(Lamp::Right), sim, reading }
-                            LampToggle { label: "Phares", lamp: Lamp::Beam, active: state.lamp_active(Lamp::Beam), sim, reading }
-                        }
-                    }
-                    div { class: "control-footer",
-                        button { class: "reset-button", onclick: move |_| dispatch(sim, reading, Command::ResetTrip), "Réinitialiser trajet" }
-                        button { class: "reset-button", onclick: move |_| dispatch(sim, reading, Command::ResetAll), "Réinitialiser tout" }
                     }
                 }
             }
-            footer { class: "app-footer",
-                span { "MÉGANE DIGITAL CLUSTER · v0.1.0" }
-                span { "PROTOTYPE NON HOMOLOGUÉ — NE PAS UTILISER COMME INSTRUMENT DE CONDUITE" }
-            }
-        }
-    }
-}
-
-#[component]
-fn Warning(label: &'static str, state: LampState, tone: &'static str) -> Element {
-    let class = lamp_class(state, tone);
-    rsx! { div { class: "{class}", span { "{label}" }, if state == LampState::Unknown { em { "?" } } } }
-}
-
-#[component]
-fn Metric(label: &'static str, value: String, unit: &'static str, progress: Option<f64>) -> Element {
-    rsx! {
-        div { class: "metric",
-            span { class: "metric-label", "{label}" }
-            div { class: "metric-value", strong { "{value}" }, span { "{unit}" } }
-            if let Some(progress) = progress {
-                div { class: "metric-track", div { class: "metric-bar", style: "width: {progress}%;" } }
-            }
+            div { class: "safety-caption", "AFFICHAGE EXPÉRIMENTAL · AUCUNE CONNEXION OBD · INSTRUMENTS RENAULT À CONSERVER" }
         }
     }
 }
@@ -293,10 +264,7 @@ fn Metric(label: &'static str, value: String, unit: &'static str, progress: Opti
 #[component]
 fn LampToggle(label: &'static str, lamp: Lamp, active: bool, sim: Signal<Simulator>, reading: Signal<VehicleSnapshot>) -> Element {
     rsx! {
-        button {
-            class: if active { "lamp-toggle active" } else { "lamp-toggle" },
-            onclick: move |_| dispatch(sim, reading, Command::ToggleLamp(lamp)),
-            "{label}"
-        }
+        button { class: if active { "lamp-toggle active" } else { "lamp-toggle" },
+            onclick: move |_| dispatch(sim, reading, Command::ToggleLamp(lamp)), "{label}" }
     }
 }
