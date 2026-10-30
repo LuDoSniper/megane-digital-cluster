@@ -1,44 +1,163 @@
-//! Display-only, future-proof presentation component: no simulator commands.
-//! Pictograms are vector prototypes inspired by ISO 2575 conventions, not certified artwork.
+//! Presentation-only cluster: consumes a telemetry snapshot, never simulator commands.
+//! All control policies and shift cues are produced upstream by the telemetry source.
 
-use cluster_core::{suggested_shift, AssistanceMode, DataQuality, LampState, ShiftAdvice, VehicleSnapshot};
+use cluster_core::{
+    AssistanceMode, InterruptionReason, LampState, Reading, ShiftAdvice,
+    TelemetryStatus, VehicleSnapshot,
+};
 use dioxus::prelude::*;
+use std::f64::consts::PI;
 
-fn reading(value: &cluster_core::Reading<f64>, precision: usize) -> String {
-    value.usable().map(|v| format!("{v:.precision$}")).unwrap_or_else(|| "—".to_string())
+fn reading(value: &Reading<f64>, digits: usize) -> String {
+    value.usable().map(|v| format!("{v:.digits$}")).unwrap_or_else(|| "—".to_string())
+}
+
+fn odometer_label(value: &Reading<f64>) -> String {
+    let Some(km) = value.usable() else { return "—".to_string(); };
+    if !km.is_finite() || *km < 0.0 { return "—".to_string(); }
+    let digits = format!("{:.0}", km);
+    let mut out = String::new();
+    for (i, ch) in digits.chars().rev().enumerate() {
+        if i != 0 && i % 3 == 0 { out.push(' '); }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+/// Screen coordinates; the gauge arc runs bottom-left → top → bottom-right.
+fn polar(radius: f64, angle_deg: f64) -> (f64, f64) {
+    let a = angle_deg * PI / 180.0;
+    (160.0 + radius * a.cos(), 160.0 + radius * a.sin())
+}
+
+fn arc_path(radius: f64, start: f64, end: f64) -> String {
+    let (sx, sy) = polar(radius, start);
+    let (ex, ey) = polar(radius, end);
+    let sweep = end - start;
+    let large = if sweep > 180.0 { 1 } else { 0 };
+    format!("M {sx:.2} {sy:.2} A {radius} {radius} 0 {large} 1 {ex:.2} {ey:.2}")
+}
+
+struct GaugeTick {
+    x1: f64, y1: f64, x2: f64, y2: f64, lx: f64, ly: f64,
+    major: bool, label: String,
+}
+
+fn ticks(max_value: usize, step: usize, major_every: usize, rpm: bool) -> Vec<GaugeTick> {
+    let count = max_value / step;
+    (0..=count).map(|i| {
+        let angle = 135.0 + i as f64 / count as f64 * 270.0;
+        let major = i % major_every == 0;
+        let (x1, y1) = polar(122.0, angle);
+        let (x2, y2) = polar(if major { 108.0 } else { 115.0 }, angle);
+        let (lx, ly) = polar(88.0, angle);
+        let value = i * step;
+        GaugeTick {
+            x1, y1, x2, y2, lx, ly, major,
+            label: if rpm { format!("{}", value / 1000) } else { value.to_string() },
+        }
+    }).collect()
 }
 
 #[component]
-pub fn Instrument(data: VehicleSnapshot, status: String) -> Element {
+fn Gauge(title: &'static str, display_value: String, raw_value: Option<f64>,
+    maximum: usize, step: usize, major_every: usize, unit: &'static str, kind: &'static str) -> Element {
+    let percentage = raw_value.map(|v| (v / maximum as f64).clamp(0.0, 1.0)).unwrap_or(0.0);
+    let active_arc = arc_path(132.0, 135.0, 135.0 + (270.0 * percentage).max(0.01));
+    let track = arc_path(132.0, 135.0, 405.0);
+    let marks = ticks(maximum, step, major_every, kind == "rpm");
+    rsx! {
+        div { class: "cluster-dial gauge-{kind}",
+            div { class: "gauge-stage",
+                svg { class: "gauge-svg", view_box: "0 0 320 320", role: "img", aria_label: "Graduations de {title}",
+                    circle { cx: "160", cy: "160", r: "150", class: "gauge-outer" }
+                    path { d: "{track}", class: "gauge-rail" }
+                    if raw_value.is_some() {
+                        path { d: "{active_arc}", class: "gauge-active" }
+                    }
+                    for tick in marks {
+                        line { x1: "{tick.x1}", y1: "{tick.y1}", x2: "{tick.x2}", y2: "{tick.y2}",
+                            class: if tick.major { "major-tick" } else { "minor-tick" } }
+                        if tick.major {
+                            text { x: "{tick.lx}", y: "{tick.ly}", class: "gauge-number", "text-anchor": "middle", "dominant-baseline": "central", "{tick.label}" }
+                        }
+                    }
+                }
+                div { class: "gauge-readout",
+                    span { "{title}" }
+                    strong { "{display_value}" }
+                    small { "{unit}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn Instrument(data: VehicleSnapshot) -> Element {
     let speed = reading(&data.speed_kmh, 0);
-    let rpm = reading(&data.rpm, 0);
+    let rpm_value = data.rpm.usable().copied();
+    let rpm = rpm_value.map(|v| format!("{:.1}", v / 1000.0)).unwrap_or_else(|| "—".to_owned());
     let fuel = reading(&data.fuel_pct, 0);
     let coolant = reading(&data.coolant_c, 0);
     let trip = reading(&data.trip_km, 1);
-    let mileage = reading(&data.simulated_odometer_km, 0);
-    let rpm_pct = data.rpm.usable().map(|v| (v / 7000.0 * 100.0).clamp(0.0, 100.0)).unwrap_or(0.0);
-    let speed_pct = data.speed_kmh.usable().map(|v| (v / 240.0 * 100.0).clamp(0.0, 100.0)).unwrap_or(0.0);
+    let mileage = odometer_label(&data.odometer_km);
+    let odometer_source = match data.odometer_km.quality {
+        cluster_core::DataQuality::Simulated => "ODOMÈTRE · FICTIF",
+        cluster_core::DataQuality::Measured => "ODOMÈTRE · MESURÉ",
+        cluster_core::DataQuality::Unknown | cluster_core::DataQuality::Stale => "ODOMÈTRE · INDISPONIBLE",
+    };
     let fuel_pct = data.fuel_pct.usable().copied().unwrap_or(0.0).clamp(0.0, 100.0);
     let coolant_pct = data.coolant_c.usable().map(|v| ((v - 40.0) / 80.0 * 100.0).clamp(0.0, 100.0)).unwrap_or(0.0);
-    let shift = suggested_shift(data.gear, data.rpm.usable().copied(), data.engine_running);
+    let gear = data.gear.usable().map(|g| g.label()).unwrap_or("—");
+    let shift = data.shift_advice.usable().copied();
     let shift_label = match shift {
-        ShiftAdvice::None => "", ShiftAdvice::Up => "↑ PASSER LE RAPPORT SUPÉRIEUR",
-        ShiftAdvice::Down => "↓ RÉTROGRADER",
+        Some(ShiftAdvice::Up) => "↑ MONTER UN RAPPORT",
+        Some(ShiftAdvice::Down) => "↓ RÉTROGRADER",
+        Some(ShiftAdvice::None) => "RAPPORT ADAPTÉ",
+        None => "CONSEIL INDISPONIBLE",
     };
-    let assist = data.assistance;
-    let assist_label = match assist.mode {
-        AssistanceMode::Off => "ASSISTANCE DÉSACTIVÉE",
-        AssistanceMode::Cruise => "RÉGULATEUR",
-        AssistanceMode::Limiter => "LIMITEUR",
+    let assist = data.assistance.usable().copied();
+    let assist_mode = match assist.map(|a| a.mode) {
+        Some(AssistanceMode::Cruise) => "RÉGULATEUR",
+        Some(AssistanceMode::Limiter) => "LIMITEUR",
+        Some(AssistanceMode::Off) => "ASSISTANCE ARRÊTÉE",
+        None => "ASSISTANCE INDISPONIBLE",
     };
-    let assist_status = if assist.temporarily_overridden { "DÉPASSEMENT" }
-        else if assist.active { "ACTIF" }
-        else if assist.mode != AssistanceMode::Off { "EN ATTENTE" }
-        else { "" };
-    let assist_speed = assist.setpoint_kmh.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".to_string());
-    let unavailable = data.speed_kmh.quality != DataQuality::Simulated;
+    let assist_status = match assist {
+        Some(a) if a.unable_to_hold => "CONSIGNE DÉPASSÉE · DESCENTE",
+        Some(a) if a.temporarily_overridden => "DÉPASSEMENT TEMPORAIRE",
+        Some(a) if a.active => "EN SERVICE",
+        Some(a) => match a.interrupted_by {
+            InterruptionReason::Brake => "EN VEILLE · FREIN",
+            InterruptionReason::Clutch => "EN VEILLE · EMBRAYAGE",
+            InterruptionReason::Neutral => "EN VEILLE · POINT MORT",
+            InterruptionReason::EngineStopped => "EN VEILLE · MOTEUR",
+            InterruptionReason::Fault => "INDISPONIBLE · DÉFAUT",
+            InterruptionReason::DriverCancel => "EN VEILLE · CONDUCTEUR",
+            InterruptionReason::None => "PRÊT À ACTIVER",
+        },
+        None => "ÉTAT INCONNU",
+    };
+    let setpoint = assist.and_then(|a| a.setpoint_kmh).map(|v| format!("{v:.0} km/h")).unwrap_or_else(|| "— km/h".to_string());
+    let assist_active = assist.is_some_and(|a| a.active);
+    let status = match data.status {
+        TelemetryStatus::Simulated => "SIMULATION",
+        TelemetryStatus::Paused => "SIMULATION EN PAUSE",
+        TelemetryStatus::Partial => "CAPTEURS INDISPONIBLES",
+        TelemetryStatus::Disconnected => "LIAISON PERDUE",
+        TelemetryStatus::Measured => "TÉLÉMÉTRIE",
+    };
+    let degraded = matches!(data.status, TelemetryStatus::Partial | TelemetryStatus::Disconnected);
     let critical = data.lights.oil_pressure == LampState::On || data.lights.brake == LampState::On;
-    let invalid = data.lights.engine == LampState::Unknown;
+    let warning = if degraded { "DONNÉES INDISPONIBLES" }
+        else if data.lights.oil_pressure == LampState::On { "PRESSION D'HUILE · ALERTE" }
+        else if data.lights.brake == LampState::On { "FREINAGE · ALERTE" }
+        else if data.lights.engine == LampState::On { "MOTEUR · CONTRÔLE REQUIS" }
+        else { "PARAMÈTRES DE CONDUITE" };
+    let warning_class = if critical || degraded { "center-alert urgent" }
+        else if data.lights.engine == LampState::On { "center-alert attention" }
+        else { "center-alert" };
 
     rsx! {
         section { class: "cluster-bezel", aria_label: "Prototype de combiné d'instruments numérique",
@@ -52,62 +171,36 @@ pub fn Instrument(data: VehicleSnapshot, status: String) -> Element {
                         small { "1.6 16V" }
                     }
                     div { class: "cluster-run-status",
-                        span { class: if unavailable { "run-bad" } else { "run-good" }, "●" }
+                        span { class: if degraded { "run-bad" } else { "run-good" }, "●" }
                         "{status}"
                     }
                     Telltale { name: "right", state: data.lights.right_indicator, tone: "green", prominent: true }
                 }
-
                 div { class: "cluster-instruments",
-                    div { class: "cluster-dial tach-dial", style: "--value: {rpm_pct}%;",
-                        div { class: "dial-ring",
-                            div { class: "dial-core",
-                                small { "RÉGIME MOTEUR" }
-                                strong { "{rpm}" }
-                                span { "tr/min" }
-                            }
-                        }
-                        div { class: "dial-scale", span { "0" } span { "1" } span { "2" } span { "3" } span { "4" } span { "5" } span { "6" } span { "7" } }
-                        span { class: "dial-foot", "x 1000 tr/min" }
-                    }
+                    Gauge { title: "VITESSE", display_value: speed, raw_value: data.speed_kmh.usable().copied(),
+                        maximum: 240, step: 10, major_every: 4, unit: "km/h", kind: "speed" }
                     div { class: "cluster-primary",
-                        div { class: "cluster-speed-heading", "VITESSE INSTANTANÉE" }
-                        div { class: if unavailable { "cluster-speed unavailable" } else { "cluster-speed" }, "{speed}" }
-                        div { class: "cluster-speed-unit", "km/h" }
-                        div { class: "cluster-drive-card",
-                            div { class: "gear-box", span { "RAPPORT" } strong { "{data.gear.label()}" } }
-                            div { class: "shift-advice",
-                                if shift == ShiftAdvice::None {
-                                    span { class: "shift-idle", "CONDUITE NORMALE" }
-                                } else {
-                                    span { class: "shift-active", "{shift_label}" }
-                                }
-                                small { "INDICATION ÉCO · SIMULÉE" }
-                            }
+                        div { class: "center-label", "CENTRE D'INFORMATION" }
+                        div { class: "{warning_class}",
+                            span { class: "center-alert-icon", if critical || degraded { "!" } else { "◆" } }
+                            span { "{warning}" }
                         }
-                        if assist.mode != AssistanceMode::Off {
-                            div { class: if assist.active { "assist-strip active" } else { "assist-strip" },
-                                span { "{assist_label}" }
-                                strong { "{assist_speed} km/h" }
-                                span { "{assist_status}" }
+                        div { class: "center-driving",
+                            div { class: "center-assist-header",
+                                span { "{assist_mode}" }
+                                span { class: if assist_active { "assist-live" } else { "assist-standby" }, "{assist_status}" }
                             }
-                        } else {
-                            div { class: "assist-strip dormant", "RÉGULATEUR / LIMITEUR  —" }
+                            strong { class: "center-assist-value", "{setpoint}" }
+                            div { class: "center-assist-caption", "CONSIGNE DE VITESSE" }
+                        }
+                        div { class: "center-lower",
+                            div { class: "compact-gear", span { "RAPPORT" } strong { "{gear}" } }
+                            div { class: "compact-shift", "{shift_label}" }
                         }
                     }
-                    div { class: "cluster-dial velocity-dial", style: "--value: {speed_pct}%;",
-                        div { class: "dial-ring",
-                            div { class: "dial-core",
-                                small { "VITESSE" }
-                                strong { "{speed}" }
-                                span { "km/h" }
-                            }
-                        }
-                        div { class: "dial-scale", span { "0" } span { "40" } span { "80" } span { "120" } span { "160" } span { "200" } span { "240" } }
-                        span { class: "dial-foot", "VITESSE / km/h" }
-                    }
+                    Gauge { title: "COMPTE-TOURS", display_value: rpm, raw_value: rpm_value,
+                        maximum: 7000, step: 250, major_every: 4, unit: "× 1 000 tr/min", kind: "rpm" }
                 }
-
                 div { class: "cluster-lamps", aria_label: "Témoins du véhicule (simulés)",
                     Telltale { name: "dipped", state: data.lights.dipped_beam, tone: "green" }
                     Telltale { name: "beam", state: data.lights.main_beam, tone: "blue" }
@@ -119,32 +212,26 @@ pub fn Instrument(data: VehicleSnapshot, status: String) -> Element {
                     Telltale { name: "brake", state: data.lights.brake, tone: "red" }
                     Telltale { name: "belt", state: data.lights.seatbelt, tone: "red" }
                 }
-                if critical || unavailable || invalid {
-                    div { class: "cluster-critical",
-                        if unavailable { "DONNÉES INDISPONIBLES — NE PAS SE FIER À CET AFFICHAGE" }
-                        else if critical { "ALERTE FREIN / PRESSION D'HUILE (SIMULÉE)" }
-                        else { "TÉMOINS INCONNUS — VÉRIFICATION NÉCESSAIRE" }
-                    }
-                }
                 div { class: "cluster-bottom",
                     div { class: "reservoir",
-                        div { class: "reservoir-label", span { "⛽ CARBURANT" } strong { "{fuel}%" } }
+                        div { class: "reservoir-label", span { "CARBURANT" } strong { "{fuel}%" } }
                         div { class: "cluster-track", div { style: "width: {fuel_pct}%;" } }
                         div { class: "reservoir-extremes", span { "E" } span { "F" } }
                     }
-                    div { class: "cluster-trip",
-                        small { "TRAJET SIMULÉ" } strong { "{trip} km" }
-                    }
-                    div { class: "cluster-mileage",
-                        small { "KILOMÉTRAGE FICTIF" } strong { "{mileage} km" }
+                    div { class: "distance-group",
+                        div { class: "cluster-mileage",
+                            small { "{odometer_source}" }
+                            strong { "{mileage} km" }
+                        }
+                        div { class: "cluster-trip", small { "TRAJET PARTIEL" } strong { "{trip} km" } }
                     }
                     div { class: "reservoir",
-                        div { class: "reservoir-label", span { "◉ TEMPÉRATURE" } strong { "{coolant}°C" } }
+                        div { class: "reservoir-label", span { "TEMPÉRATURE MOTEUR" } strong { "{coolant} °C" } }
                         div { class: "cluster-track coolant", div { style: "width: {coolant_pct}%;" } }
                         div { class: "reservoir-extremes", span { "C" } span { "H" } }
                     }
                 }
-                div { class: "sim-watermark", "PROTOTYPE · DONNÉES SIMULÉES · NE PAS UTILISER POUR CONDUIRE" }
+                div { class: "sim-watermark", "PROTOTYPE · AUCUNE CONNEXION À LA VOITURE · NE PAS UTILISER POUR CONDUIRE" }
             }
         }
     }
@@ -204,5 +291,30 @@ fn Telltale(name: &'static str, state: LampState, tone: &'static str, #[props(de
             }
             if state == LampState::Unknown { span { class: "unknown-mark", "?" } }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tick_labels_are_actually_on_the_dial() {
+        let speed = ticks(240, 10, 4, false);
+        let rpm = ticks(7000, 250, 4, true);
+        assert_eq!(speed.len(), 25);
+        assert_eq!(rpm.len(), 29);
+        assert_eq!(speed.iter().filter(|t| t.major).count(), 7);
+        assert_eq!(rpm.iter().filter(|t| t.major).count(), 8);
+        assert_eq!(speed.last().unwrap().label, "240");
+        assert_eq!(rpm.last().unwrap().label, "7");
+        assert!(speed.iter().any(|t| (t.lx - t.x1).abs() > 1.0));
+    }
+
+    #[test]
+    fn measured_odometer_is_formatted_and_unknown_is_not_invented() {
+        assert_eq!(odometer_label(&Reading::simulated(182_450.0)), "182 450");
+        assert_eq!(odometer_label(&Reading::unknown()), "—");
+        assert_eq!(odometer_label(&Reading::stale(182_450.0)), "—");
     }
 }

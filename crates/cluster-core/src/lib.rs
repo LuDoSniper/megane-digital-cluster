@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub enum DataQuality {
     /// A value from the simulator, never a measured vehicle value.
     Simulated,
+    /// Read from a vehicle adapter; validity is established by the adapter, not the display.
+    Measured,
     /// The input is not known: do not substitute a nominal reading.
     Unknown,
     /// Previously known reading whose update deadline has passed.
@@ -24,6 +26,10 @@ impl<T> Reading<T> {
         Self { value: Some(value), quality: DataQuality::Simulated }
     }
 
+    pub fn measured(value: T) -> Self {
+        Self { value: Some(value), quality: DataQuality::Measured }
+    }
+
     pub fn unknown() -> Self {
         Self { value: None, quality: DataQuality::Unknown }
     }
@@ -33,7 +39,7 @@ impl<T> Reading<T> {
     }
 
     pub fn usable(&self) -> Option<&T> {
-        if self.quality == DataQuality::Simulated { self.value.as_ref() } else { None }
+        if matches!(self.quality, DataQuality::Simulated | DataQuality::Measured) { self.value.as_ref() } else { None }
     }
 }
 
@@ -124,33 +130,28 @@ pub struct SpeedAssistance {
     pub setpoint_kmh: Option<f64>,
     pub active: bool,
     pub temporarily_overridden: bool,
+    /// The target cannot be held (for example a long descent without automatic braking).
+    pub unable_to_hold: bool,
+    /// Actual throttle delivered by the simulator/controller, not the pedal position.
+    pub effective_throttle_pct: f64,
+    /// Explicit cancellation cause supplied by a source. Never inferred by the display.
+    pub interrupted_by: InterruptionReason,
 }
 
 impl Default for SpeedAssistance {
     fn default() -> Self {
-        Self { mode: AssistanceMode::Off, setpoint_kmh: None, active: false, temporarily_overridden: false }
+        Self { mode: AssistanceMode::Off, setpoint_kmh: None, active: false, temporarily_overridden: false, unable_to_hold: false, effective_throttle_pct: 0.0, interrupted_by: InterruptionReason::None }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterruptionReason { None, Brake, Clutch, Neutral, EngineStopped, Fault, DriverCancel }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TelemetryStatus { Simulated, Paused, Partial, Disconnected, Measured }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShiftAdvice { None, Up, Down }
-
-/// Illustrative eco shift cue: never a manufacturer-approved driving recommendation.
-pub fn suggested_shift(gear: Gear, rpm: Option<f64>, running: bool) -> ShiftAdvice {
-    if !running { return ShiftAdvice::None; }
-    let Some(rpm) = rpm else { return ShiftAdvice::None; };
-    if !rpm.is_finite() { return ShiftAdvice::None; }
-    match gear {
-        Gear::Reverse | Gear::Neutral => ShiftAdvice::None,
-        Gear::Fifth if rpm < 1300.0 => ShiftAdvice::Down,
-        Gear::Fifth => ShiftAdvice::None,
-        Gear::First if rpm > 3100.0 => ShiftAdvice::Up,
-        Gear::First => ShiftAdvice::None,
-        _ if rpm > 3000.0 => ShiftAdvice::Up,
-        _ if rpm < 1300.0 => ShiftAdvice::Down,
-        _ => ShiftAdvice::None,
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VehicleSnapshot {
@@ -160,11 +161,14 @@ pub struct VehicleSnapshot {
     pub fuel_pct: Reading<f64>,
     pub battery_v: Reading<f64>,
     pub trip_km: Reading<f64>,
-    /// Fictional simulator mileage, not the odometer read from a Renault ECU.
-    pub simulated_odometer_km: Reading<f64>,
-    pub gear: Gear,
-    pub engine_running: bool,
-    pub assistance: SpeedAssistance,
+    /// Source-provided mileage. Missing by default; OBD-II generic does not imply availability.
+    /// A simulated value must never be presented as the legal odometer.
+    pub odometer_km: Reading<f64>,
+    pub gear: Reading<Gear>,
+    pub engine_running: Reading<bool>,
+    pub assistance: Reading<SpeedAssistance>,
+    pub shift_advice: Reading<ShiftAdvice>,
+    pub status: TelemetryStatus,
     pub lights: WarningLights,
     pub elapsed_simulation_s: f64,
 }
@@ -175,8 +179,9 @@ impl Default for VehicleSnapshot {
             speed_kmh: Reading::unknown(), rpm: Reading::unknown(),
             coolant_c: Reading::unknown(), fuel_pct: Reading::unknown(),
             battery_v: Reading::unknown(), trip_km: Reading::unknown(),
-            simulated_odometer_km: Reading::unknown(), gear: Gear::Neutral,
-            engine_running: false, assistance: SpeedAssistance::default(),
+            odometer_km: Reading::unknown(), gear: Reading::unknown(),
+            engine_running: Reading::unknown(), assistance: Reading::unknown(),
+            shift_advice: Reading::unknown(), status: TelemetryStatus::Disconnected,
             lights: WarningLights::unknown(), elapsed_simulation_s: 0.0,
         }
     }
@@ -197,6 +202,7 @@ mod tests {
         assert_eq!(Reading::<f64>::unknown().usable(), None);
         assert_eq!(Reading::stale(80.0).usable(), None);
         assert_eq!(Reading::simulated(80.0).usable(), Some(&80.0));
+        assert_eq!(Reading::measured(90.0).usable(), Some(&90.0));
     }
 
     #[test]
@@ -206,12 +212,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_advice_only_for_valid_forward_gears() {
-        assert_eq!(suggested_shift(Gear::Third, Some(3500.0), true), ShiftAdvice::Up);
-        assert_eq!(suggested_shift(Gear::Third, Some(1050.0), true), ShiftAdvice::Down);
-        assert_eq!(suggested_shift(Gear::Neutral, Some(4000.0), true), ShiftAdvice::None);
-        assert_eq!(suggested_shift(Gear::Fifth, None, true), ShiftAdvice::None);
-        assert_eq!(suggested_shift(Gear::Second, Some(5000.0), false), ShiftAdvice::None);
+    fn default_frame_never_invents_gear_or_assistance() {
+        let frame = VehicleSnapshot::default();
+        assert!(frame.gear.usable().is_none());
+        assert!(frame.assistance.usable().is_none());
+        assert!(frame.shift_advice.usable().is_none());
     }
 
     #[test]

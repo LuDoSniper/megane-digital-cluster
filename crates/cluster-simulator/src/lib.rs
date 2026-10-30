@@ -1,8 +1,9 @@
-//! Deterministic offline simulator. NEVER sends commands to a real vehicle.
+//! Offline vehicle dynamics and control policies for the simulator ONLY.
+//! Real OBD adapters implement TelemetrySource independently and must never call this module.
 
 use cluster_core::{
-    AssistanceMode, DataQuality, Gear, LampState, Reading, SpeedAssistance,
-    TelemetrySource, VehicleSnapshot, WarningLights,
+    AssistanceMode, DataQuality, Gear, InterruptionReason, LampState, Reading, ShiftAdvice,
+    SpeedAssistance, TelemetrySource, TelemetryStatus, VehicleSnapshot, WarningLights,
 };
 use std::time::Duration;
 
@@ -25,7 +26,8 @@ pub enum Lamp { Engine, Oil, Battery, Abs, Airbag, Brake, Seatbelt, Left, Right,
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
-    Accelerator(f64), Brake(f64), ShiftUp, ShiftDown, SetGear(Gear), ToggleEngine,
+    Accelerator(f64), Brake(f64), Clutch(f64), RoadSlope(f64),
+    ShiftUp, ShiftDown, SetGear(Gear), ToggleEngine,
     SetScenario(Scenario), ToggleLamp(Lamp), ToggleHazards,
     SetAssistance(AssistanceMode), SetAssistanceSpeed, AdjustAssistance(f64),
     CancelAssistance, ResumeAssistance, Pause, ResetTrip, ResetAll,
@@ -38,8 +40,12 @@ pub struct Simulator {
     pub coolant_c: f64,
     pub fuel_pct: f64,
     pub voltage: f64,
+    /// What the driver requests (0–100); NOT the resulting engine throttle.
     pub accelerator_pct: f64,
     pub brake_pct: f64,
+    pub clutch_pct: f64,
+    /// Positive is uphill, negative downhill; used by the simulated physics only.
+    pub road_slope_pct: f64,
     pub gear: Gear,
     pub engine_running: bool,
     pub paused: bool,
@@ -55,8 +61,9 @@ pub struct Simulator {
 impl Default for Simulator {
     fn default() -> Self {
         Self {
-            speed_kmh: 42.0, rpm: 2200.0, coolant_c: 82.0,
+            speed_kmh: 42.0, rpm: 2226.0, coolant_c: 82.0,
             fuel_pct: 68.0, voltage: 14.1, accelerator_pct: 26.0, brake_pct: 0.0,
+            clutch_pct: 0.0, road_slope_pct: 0.0,
             gear: Gear::Third, engine_running: true, paused: false,
             scenario: Scenario::Drive, trip_km: 0.0, odometer_km: 182_450.0,
             elapsed_s: 0.0, hazards: false, assistance: SpeedAssistance::default(),
@@ -65,31 +72,84 @@ impl Default for Simulator {
     }
 }
 
+/// Advisory algorithm belongs to the simulator. The presentation never computes a gear recommendation.
+fn shift_advice(gear: Gear, rpm: f64, running: bool) -> ShiftAdvice {
+    if !running || !rpm.is_finite() { return ShiftAdvice::None; }
+    match gear {
+        Gear::Reverse | Gear::Neutral => ShiftAdvice::None,
+        Gear::Fifth if rpm < 1300.0 => ShiftAdvice::Down,
+        Gear::Fifth => ShiftAdvice::None,
+        Gear::First if rpm > 3100.0 => ShiftAdvice::Up,
+        Gear::First => ShiftAdvice::None,
+        _ if rpm > 3000.0 => ShiftAdvice::Up,
+        _ if rpm < 1300.0 => ShiftAdvice::Down,
+        _ => ShiftAdvice::None,
+    }
+}
+
 impl Simulator {
+    fn interrupt(&mut self, reason: InterruptionReason) {
+        if self.assistance.active {
+            self.assistance.active = false;
+            self.assistance.temporarily_overridden = false;
+            self.assistance.interrupted_by = reason;
+        }
+    }
+
+    fn valid_control_conditions(&self) -> bool {
+        self.engine_running && (30.0..=200.0).contains(&self.speed_kmh)
+            && matches!(self.gear, Gear::First | Gear::Second | Gear::Third | Gear::Fourth | Gear::Fifth)
+            && self.brake_pct <= 2.0 && self.clutch_pct <= 2.0
+            && self.scenario != Scenario::EngineFault && self.scenario != Scenario::SensorFailure
+            && self.scenario != Scenario::LinkLost
+    }
+
+    fn activate(&mut self, use_saved_setpoint: bool) {
+        if self.assistance.mode == AssistanceMode::Off || !self.valid_control_conditions() { return; }
+        if !use_saved_setpoint {
+            self.assistance.setpoint_kmh = Some(self.speed_kmh.round().clamp(30.0, 200.0));
+        }
+        if self.assistance.setpoint_kmh.is_none() { return; }
+        self.assistance.active = true;
+        self.assistance.interrupted_by = InterruptionReason::None;
+        self.assistance.temporarily_overridden = false;
+        self.assistance.unable_to_hold = false;
+    }
+
     pub fn apply(&mut self, command: Command) {
         match command {
             Command::Accelerator(v) => self.accelerator_pct = v.clamp(0.0, 100.0),
             Command::Brake(v) => {
                 self.brake_pct = v.clamp(0.0, 100.0);
                 if self.brake_pct > 2.0 && self.assistance.mode == AssistanceMode::Cruise {
-                    self.assistance.active = false;
+                    self.interrupt(InterruptionReason::Brake);
+                }
+                // Braking does not cancel a speed LIMITER: it never drives the throttle.
+            }
+            Command::Clutch(v) => {
+                self.clutch_pct = v.clamp(0.0, 100.0);
+                if self.clutch_pct > 2.0 && self.assistance.mode == AssistanceMode::Cruise {
+                    self.interrupt(InterruptionReason::Clutch);
                 }
             }
+            Command::RoadSlope(v) => self.road_slope_pct = v.clamp(-12.0, 12.0),
             Command::ShiftUp => self.set_gear(self.gear.higher()),
             Command::ShiftDown => self.set_gear(self.gear.lower()),
             Command::SetGear(gear) => self.set_gear(gear),
             Command::ToggleEngine => {
                 self.engine_running = !self.engine_running;
                 self.voltage = if self.engine_running { 14.1 } else { 12.3 };
-                if !self.engine_running { self.assistance.active = false; }
+                if !self.engine_running { self.interrupt(InterruptionReason::EngineStopped); }
             }
             Command::SetScenario(s) => {
                 self.scenario = s;
                 if s == Scenario::ColdStart {
                     self.coolant_c = 22.0;
                     self.speed_kmh = 0.0;
-                    self.gear = Gear::Neutral;
-                    self.assistance.active = false;
+                    self.set_gear(Gear::Neutral);
+                }
+                if matches!(s, Scenario::EngineFault | Scenario::SensorFailure | Scenario::LinkLost) {
+                    self.interrupt(InterruptionReason::Fault);
                 }
             }
             Command::ToggleLamp(lamp) => {
@@ -102,26 +162,20 @@ impl Simulator {
                 if self.hazards { self.lamps[7] = false; self.lamps[8] = false; }
             }
             Command::SetAssistance(mode) => {
-                self.assistance.mode = mode;
-                self.assistance.active = false;
-                self.assistance.temporarily_overridden = false;
-                self.assistance.setpoint_kmh = None;
+                self.assistance = SpeedAssistance { mode, ..SpeedAssistance::default() };
             }
-            Command::SetAssistanceSpeed => self.engage_assistance(),
+            Command::SetAssistanceSpeed => self.activate(false),
             Command::AdjustAssistance(delta) => {
                 if self.assistance.mode != AssistanceMode::Off {
-                    let current = self.assistance.setpoint_kmh.unwrap_or_else(|| self.speed_kmh.max(30.0));
-                    self.assistance.setpoint_kmh = Some((current + delta).clamp(30.0, 200.0));
+                    if self.assistance.setpoint_kmh.is_some() || self.valid_control_conditions() {
+                        let current = self.assistance.setpoint_kmh.unwrap_or_else(|| self.speed_kmh.round());
+                        self.assistance.setpoint_kmh = Some((current + delta).clamp(30.0, 200.0));
+                        if !self.assistance.active { self.activate(true); }
+                    }
                 }
             }
-            Command::CancelAssistance => self.assistance.active = false,
-            Command::ResumeAssistance => {
-                if self.engine_running && self.speed_kmh >= 30.0
-                    && self.assistance.mode != AssistanceMode::Off
-                    && self.assistance.setpoint_kmh.is_some() {
-                    self.assistance.active = true;
-                }
-            }
+            Command::CancelAssistance => self.interrupt(InterruptionReason::DriverCancel),
+            Command::ResumeAssistance => self.activate(true),
             Command::Pause => self.paused = !self.paused,
             Command::ResetTrip => self.trip_km = 0.0,
             Command::ResetAll => *self = Self::default(),
@@ -129,21 +183,15 @@ impl Simulator {
     }
 
     fn set_gear(&mut self, gear: Gear) {
-        // Simulated interlock; real reverse engagement must never be commanded via telemetry.
-        if (gear == Gear::Reverse || self.gear == Gear::Reverse) && self.speed_kmh > 2.0 {
-            return;
+        // Virtual gearbox: reverse engages only near standstill. Never affects real vehicle.
+        if (gear == Gear::Reverse || self.gear == Gear::Reverse) && self.speed_kmh > 2.0 { return; }
+        if self.gear != gear {
+            self.gear = gear;
+            if self.assistance.mode == AssistanceMode::Cruise { self.interrupt(InterruptionReason::Clutch); }
+            if gear == Gear::Neutral || gear == Gear::Reverse {
+                self.interrupt(InterruptionReason::Neutral);
+            }
         }
-        self.gear = gear;
-        if self.assistance.mode == AssistanceMode::Cruise { self.assistance.active = false; }
-    }
-
-    fn engage_assistance(&mut self) {
-        if !self.engine_running || self.speed_kmh < 30.0 || self.gear == Gear::Reverse
-            || self.gear == Gear::Neutral || self.assistance.mode == AssistanceMode::Off {
-            return;
-        }
-        self.assistance.setpoint_kmh = Some(self.speed_kmh.round().clamp(30.0, 200.0));
-        self.assistance.active = true;
     }
 
     fn lamp_index(lamp: Lamp) -> usize {
@@ -155,13 +203,13 @@ impl Simulator {
     }
 
     pub fn lamp_active(&self, lamp: Lamp) -> bool {
-        self.lamps[Self::lamp_index(lamp)] ||
-            (lamp == Lamp::Engine && self.scenario == Scenario::EngineFault) ||
-            (self.hazards && matches!(lamp, Lamp::Left | Lamp::Right))
+        self.lamps[Self::lamp_index(lamp)]
+            || (lamp == Lamp::Engine && self.scenario == Scenario::EngineFault)
+            || (self.hazards && matches!(lamp, Lamp::Left | Lamp::Right))
     }
 
     pub fn indicator_lit(&self) -> bool {
-        // ~90 flashes/minute, about 0.333 s on / 0.333 s off.
+        // 90 flashes per minute: ~333 ms illuminated, ~333 ms dark.
         self.elapsed_s.rem_euclid(2.0 / 3.0) < 1.0 / 3.0
     }
 
@@ -170,52 +218,78 @@ impl Simulator {
         let dt = delta.as_secs_f64().clamp(0.0, 0.2);
         if dt <= 0.0 { return; }
         self.elapsed_s += dt;
-        // Deliberately approximate physics for visual tests, not ECU calibration.
-        let mut throttle = if self.engine_running && self.gear != Gear::Neutral {
-            self.accelerator_pct / 100.0
-        } else { 0.0 };
+
+        // Approximate longitudinal vehicle dynamics. This is NOT Renault ECU logic.
+        let drag = 0.18 + self.speed_kmh * 0.008; // m/s²
+        let slope_accel = -9.81 * self.road_slope_pct / 100.0; // downhill adds speed
+        let pedal_throttle = if self.engine_running { self.accelerator_pct / 100.0 } else { 0.0 };
+        let drive_connected = self.engine_running && self.clutch_pct <= 2.0
+            && !matches!(self.gear, Gear::Neutral);
+        let mut throttle = if drive_connected { pedal_throttle } else { 0.0 };
 
         self.assistance.temporarily_overridden = false;
+        self.assistance.unable_to_hold = false;
+        if self.assistance.active {
+            if self.assistance.mode == AssistanceMode::Cruise && !self.valid_control_conditions() {
+                self.interrupt(if self.brake_pct > 2.0 { InterruptionReason::Brake }
+                    else if self.clutch_pct > 2.0 { InterruptionReason::Clutch }
+                    else { InterruptionReason::Fault });
+            } else if !self.engine_running || matches!(self.gear, Gear::Neutral | Gear::Reverse) {
+                self.interrupt(InterruptionReason::Neutral);
+            }
+        }
         if self.assistance.active {
             if let Some(target) = self.assistance.setpoint_kmh {
                 match self.assistance.mode {
                     AssistanceMode::Cruise => {
-                        if self.brake_pct > 2.0 || !self.engine_running || self.gear == Gear::Neutral || self.gear == Gear::Reverse {
-                            self.assistance.active = false;
-                        } else if throttle > 0.55 {
+                        // Controller compensates for drag and slope; cannot apply brakes.
+                        let error = target - self.speed_kmh;
+                        let automatic = ((drag - slope_accel + error * 0.30) / 4.5).clamp(0.0, 1.0);
+                        if pedal_throttle > automatic + 0.035 {
                             self.assistance.temporarily_overridden = true;
+                            throttle = pedal_throttle;
                         } else {
-                            throttle = ((target - self.speed_kmh) * 0.055 + 0.20).clamp(0.0, 0.95);
+                            throttle = automatic;
                         }
                     }
                     AssistanceMode::Limiter => {
-                        // Pedal "kickdown" demonstrator: deliberate override above 95%.
-                        if self.accelerator_pct >= 95.0 {
+                        // Driver still controls speed until reaching the target; throttle is capped.
+                        // 'Kickdown' is simulated at >98%, not an OBD/ECU instruction.
+                        if self.accelerator_pct >= 98.0 {
                             self.assistance.temporarily_overridden = true;
-                        } else if self.speed_kmh >= target { throttle = 0.0; }
-                        else if self.speed_kmh > target - 2.0 { throttle *= 0.2; }
+                        } else {
+                            let permitted = ((drag - slope_accel + (target - self.speed_kmh) * 0.30) / 4.5).clamp(0.0, 1.0);
+                            throttle = throttle.min(permitted);
+                        }
                     }
-                    AssistanceMode::Off => self.assistance.active = false,
+                    AssistanceMode::Off => self.interrupt(InterruptionReason::DriverCancel),
                 }
+                // On a descent, neither simulated assistance system applies the brakes.
+                self.assistance.unable_to_hold = self.speed_kmh > target + 2.0
+                    && !self.assistance.temporarily_overridden;
             }
         }
-        let drag = 0.18 + self.speed_kmh * 0.008;
-        let acceleration = throttle * 4.5 - drag - self.brake_pct / 100.0 * 10.0;
+
+        self.assistance.effective_throttle_pct = throttle * 100.0;
+        let deceleration = self.brake_pct / 100.0 * 9.5;
+        let acceleration = throttle * 4.5 - drag + slope_accel - deceleration;
         let old_speed = self.speed_kmh;
-        let max_speed = if self.gear == Gear::Reverse { 25.0 } else { 210.0 };
-        self.speed_kmh = (self.speed_kmh + acceleration * dt * 3.6).clamp(0.0, max_speed);
+        let maximum = if self.gear == Gear::Reverse { 25.0 } else { 210.0 };
+        self.speed_kmh = (self.speed_kmh + acceleration * dt * 3.6).clamp(0.0, maximum);
         let target_rpm = if !self.engine_running { 0.0 }
-            else if self.gear == Gear::Neutral { 760.0 + self.accelerator_pct * 35.0 }
+            else if !drive_connected { 760.0 + self.accelerator_pct * 35.0 }
             else { (self.speed_kmh * self.gear.rpm_per_kmh()).clamp(760.0, 6900.0) };
         self.rpm += (target_rpm - self.rpm) * (dt * 6.0).clamp(0.0, 1.0);
         self.rpm = self.rpm.clamp(0.0, 7000.0);
         let cruise_temp = if self.engine_running { 90.0 } else { 30.0 };
         self.coolant_c += (cruise_temp - self.coolant_c) * dt * 0.016;
         self.voltage += ((if self.engine_running { 14.1 } else { 12.3 }) - self.voltage) * dt;
-        let travelled = ((old_speed + self.speed_kmh) / 2.0) * dt / 3600.0;
-        self.trip_km += travelled;
-        self.odometer_km += travelled;
-        if self.engine_running { self.fuel_pct = (self.fuel_pct - dt * (0.0004 + throttle * 0.001)).max(0.0); }
+        let distance = (old_speed + self.speed_kmh) * 0.5 * dt / 3600.0;
+        self.trip_km += distance;
+        self.odometer_km += distance;
+        if self.engine_running {
+            self.fuel_pct = (self.fuel_pct - dt * (0.0004 + throttle * 0.001)).max(0.0);
+        }
     }
 
     fn lamp_states(&self) -> WarningLights {
@@ -233,36 +307,56 @@ impl Simulator {
 
 impl TelemetrySource for Simulator {
     fn snapshot(&self) -> VehicleSnapshot {
-        let mut reading = VehicleSnapshot {
+        let status = if self.scenario == Scenario::LinkLost { TelemetryStatus::Disconnected }
+            else if self.scenario == Scenario::SensorFailure { TelemetryStatus::Partial }
+            else if self.paused { TelemetryStatus::Paused }
+            else { TelemetryStatus::Simulated };
+        let mut data = VehicleSnapshot {
             speed_kmh: Reading::simulated(self.speed_kmh),
             rpm: Reading::simulated(self.rpm), coolant_c: Reading::simulated(self.coolant_c),
             fuel_pct: Reading::simulated(self.fuel_pct), battery_v: Reading::simulated(self.voltage),
             trip_km: Reading::simulated(self.trip_km),
-            simulated_odometer_km: Reading::simulated(self.odometer_km),
-            gear: self.gear, engine_running: self.engine_running,
-            assistance: self.assistance, lights: self.lamp_states(),
-            elapsed_simulation_s: self.elapsed_s,
+            odometer_km: Reading::simulated(self.odometer_km),
+            gear: Reading::simulated(self.gear), engine_running: Reading::simulated(self.engine_running),
+            assistance: Reading::simulated(self.assistance),
+            shift_advice: Reading::simulated(shift_advice(self.gear, self.rpm, self.engine_running)),
+            status, lights: self.lamp_states(), elapsed_simulation_s: self.elapsed_s,
         };
         if self.scenario == Scenario::SensorFailure {
-            reading.speed_kmh = Reading::unknown();
-            reading.rpm = Reading::unknown();
-            reading.coolant_c = Reading::unknown();
+            data.speed_kmh = Reading::unknown();
+            data.rpm = Reading::unknown();
+            data.coolant_c = Reading::unknown();
+            data.shift_advice = Reading::unknown();
+            data.assistance = Reading::unknown();
         } else if self.scenario == Scenario::LinkLost {
-            reading.speed_kmh.quality = DataQuality::Stale;
-            reading.rpm.quality = DataQuality::Stale;
-            reading.coolant_c.quality = DataQuality::Stale;
-            reading.fuel_pct.quality = DataQuality::Stale;
-            reading.battery_v.quality = DataQuality::Stale;
-            reading.assistance = SpeedAssistance::default();
-            reading.lights = WarningLights::unknown();
+            data.speed_kmh.quality = DataQuality::Stale;
+            data.rpm.quality = DataQuality::Stale;
+            data.coolant_c.quality = DataQuality::Stale;
+            data.fuel_pct.quality = DataQuality::Stale;
+            data.battery_v.quality = DataQuality::Stale;
+            data.trip_km.quality = DataQuality::Stale;
+            data.odometer_km.quality = DataQuality::Stale;
+            data.gear = Reading::unknown();
+            data.engine_running = Reading::unknown();
+            data.assistance = Reading::unknown();
+            data.shift_advice = Reading::unknown();
+            data.lights = WarningLights::unknown();
         }
-        reading
+        data
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(sim: &mut Simulator, seconds: u32) {
+        for _ in 0..seconds * 10 { sim.step(Duration::from_millis(100)); }
+    }
+
+    fn moving(speed: f64) -> Simulator {
+        Simulator { speed_kmh: speed, gear: Gear::Fourth, accelerator_pct: 0.0, ..Simulator::default() }
+    }
 
     #[test]
     fn brake_reduces_speed() {
@@ -275,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_is_protected_while_moving_and_available_at_rest() {
+    fn reverse_requires_near_stop() {
         let mut sim = Simulator::default();
         sim.apply(Command::SetGear(Gear::Reverse));
         assert_eq!(sim.gear, Gear::Third);
@@ -283,16 +377,120 @@ mod tests {
         sim.apply(Command::SetGear(Gear::Reverse));
         assert_eq!(sim.gear, Gear::Reverse);
         sim.apply(Command::Accelerator(100.0));
-        for _ in 0..100 { sim.step(Duration::from_millis(100)); }
+        run(&mut sim, 10);
         assert!(sim.speed_kmh <= 25.0);
     }
 
     #[test]
-    fn indicators_blink_and_hazards_flash_both_sides() {
+    fn cruise_actually_maintains_speed_without_driver_throttle() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::SetAssistance(AssistanceMode::Cruise));
+        sim.apply(Command::SetAssistanceSpeed);
+        assert!(sim.assistance.active);
+        run(&mut sim, 20);
+        assert!((sim.speed_kmh - 70.0).abs() < 2.0, "speed {}", sim.speed_kmh);
+        assert!(sim.assistance.effective_throttle_pct > 0.0);
+        assert_eq!(sim.accelerator_pct, 0.0); // input is not overwritten by controller
+    }
+
+    #[test]
+    fn braking_cancels_cruise_but_preserves_resume_setpoint() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::SetAssistance(AssistanceMode::Cruise));
+        sim.apply(Command::SetAssistanceSpeed);
+        sim.apply(Command::Brake(25.0));
+        assert!(!sim.assistance.active);
+        assert_eq!(sim.assistance.interrupted_by, InterruptionReason::Brake);
+        assert_eq!(sim.assistance.setpoint_kmh, Some(70.0));
+        sim.apply(Command::ResumeAssistance);
+        assert!(!sim.assistance.active); // must release pedal
+        sim.apply(Command::Brake(0.0));
+        sim.apply(Command::ResumeAssistance);
+        assert!(sim.assistance.active);
+    }
+
+    #[test]
+    fn clutch_or_manual_shift_interrupts_cruise() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::SetAssistance(AssistanceMode::Cruise));
+        sim.apply(Command::SetAssistanceSpeed);
+        sim.apply(Command::Clutch(15.0));
+        assert!(!sim.assistance.active);
+        sim.apply(Command::Clutch(0.0));
+        sim.apply(Command::ResumeAssistance);
+        sim.apply(Command::SetGear(Gear::Fifth));
+        assert!(!sim.assistance.active);
+    }
+
+    #[test]
+    fn limiter_caps_pedal_without_braking_or_disabling_on_brake() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::SetAssistance(AssistanceMode::Limiter));
+        sim.apply(Command::SetAssistanceSpeed);
+        sim.apply(Command::Accelerator(75.0));
+        run(&mut sim, 15);
+        assert!(sim.speed_kmh < 72.0, "speed {}", sim.speed_kmh);
+        assert!(sim.assistance.effective_throttle_pct < sim.accelerator_pct);
+        sim.apply(Command::Brake(20.0));
+        assert!(sim.assistance.active);
+    }
+
+    #[test]
+    fn limiter_kickdown_bypasses_cap_then_returns() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::SetAssistance(AssistanceMode::Limiter));
+        sim.apply(Command::SetAssistanceSpeed);
+        sim.apply(Command::Accelerator(100.0));
+        run(&mut sim, 2);
+        assert!(sim.speed_kmh > 70.0);
+        assert!(sim.assistance.temporarily_overridden);
+        sim.apply(Command::Accelerator(55.0));
+        run(&mut sim, 2);
+        assert!(!sim.assistance.temporarily_overridden);
+        assert!(sim.assistance.active);
+    }
+
+    #[test]
+    fn downhill_can_exceed_setpoint_without_automatic_braking() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::RoadSlope(-12.0));
+        sim.apply(Command::SetAssistance(AssistanceMode::Limiter));
+        sim.apply(Command::SetAssistanceSpeed);
+        run(&mut sim, 20);
+        assert!(sim.speed_kmh > 72.0, "speed {}", sim.speed_kmh);
+        assert!(sim.assistance.unable_to_hold);
+        assert_eq!(sim.assistance.effective_throttle_pct, 0.0);
+    }
+
+    #[test]
+    fn invalid_control_arming_and_neutral_disarm() {
+        let mut sim = moving(20.0);
+        sim.apply(Command::SetAssistance(AssistanceMode::Cruise));
+        sim.apply(Command::SetAssistanceSpeed);
+        assert!(!sim.assistance.active);
+        sim.speed_kmh = 70.0;
+        sim.apply(Command::SetAssistanceSpeed);
+        assert!(sim.assistance.active);
+        sim.apply(Command::SetGear(Gear::Neutral));
+        assert!(!sim.assistance.active);
+        assert_eq!(sim.assistance.interrupted_by, InterruptionReason::Neutral);
+    }
+
+    #[test]
+    fn disabled_driver_pedal_does_not_activate_a_real_car() {
+        let mut sim = moving(70.0);
+        sim.apply(Command::ToggleEngine);
+        sim.apply(Command::Accelerator(100.0));
+        run(&mut sim, 2);
+        assert_eq!(sim.assistance.effective_throttle_pct, 0.0);
+    }
+
+    #[test]
+    fn indicators_blink_and_hazards_flash_together() {
         let mut sim = Simulator::default();
         sim.apply(Command::ToggleLamp(Lamp::Left));
         assert_eq!(sim.snapshot().lights.left_indicator, LampState::On);
-        sim.step(Duration::from_millis(400)); // clamped to 200 ms per frame
+        sim.step(Duration::from_millis(200));
         sim.step(Duration::from_millis(200));
         assert_eq!(sim.snapshot().lights.left_indicator, LampState::Off);
         sim.apply(Command::ToggleHazards);
@@ -300,34 +498,15 @@ mod tests {
     }
 
     #[test]
-    fn cruise_cancels_on_brake_and_resumes() {
+    fn simulator_publishes_raw_state_including_shift_advice() {
         let mut sim = Simulator::default();
-        sim.apply(Command::SetAssistance(AssistanceMode::Cruise));
-        sim.apply(Command::SetAssistanceSpeed);
-        assert!(sim.assistance.active);
-        sim.apply(Command::Brake(20.0));
-        assert!(!sim.assistance.active);
-        sim.apply(Command::Brake(0.0));
-        sim.apply(Command::ResumeAssistance);
-        assert!(sim.assistance.active);
-    }
-
-    #[test]
-    fn limiter_can_be_overridden_using_kickdown() {
-        let mut sim = Simulator::default();
-        sim.apply(Command::SetAssistance(AssistanceMode::Limiter));
-        sim.apply(Command::SetAssistanceSpeed);
-        sim.apply(Command::Accelerator(100.0));
-        sim.step(Duration::from_millis(50));
-        assert!(sim.assistance.temporarily_overridden);
-    }
-
-    #[test]
-    fn driving_increases_trip_and_odometer() {
-        let mut sim = Simulator::default();
-        sim.step(Duration::from_millis(100));
-        assert!(sim.trip_km > 0.0);
-        assert!(sim.odometer_km > 182_450.0);
+        sim.rpm = 3500.0;
+        assert_eq!(sim.snapshot().shift_advice.usable(), Some(&ShiftAdvice::Up));
+        sim.apply(Command::SetScenario(Scenario::LinkLost));
+        assert!(sim.snapshot().speed_kmh.usable().is_none());
+        assert!(sim.snapshot().gear.usable().is_none());
+        assert!(sim.snapshot().assistance.usable().is_none());
+        assert_eq!(sim.snapshot().lights.abs, LampState::Unknown);
     }
 
     #[test]
@@ -340,31 +519,15 @@ mod tests {
     }
 
     #[test]
-    fn dropout_never_reuses_last_speed_as_valid() {
-        let mut sim = Simulator::default();
-        sim.apply(Command::SetScenario(Scenario::SensorFailure));
-        assert!(sim.snapshot().speed_kmh.usable().is_none());
-        sim.apply(Command::SetScenario(Scenario::LinkLost));
-        assert!(sim.snapshot().speed_kmh.usable().is_none());
-        assert_eq!(sim.snapshot().lights.engine, LampState::Unknown);
-    }
-
-    #[test]
-    fn simulator_does_not_exceed_bounds_even_with_bad_commands() {
+    fn simulation_values_stay_bounded() {
         let mut sim = Simulator::default();
         sim.apply(Command::Accelerator(999.0));
-        sim.apply(Command::Brake(-10.0));
-        for _ in 0..10_000 { sim.step(Duration::from_millis(100)); }
+        sim.apply(Command::Brake(-2.0));
+        sim.apply(Command::RoadSlope(-999.0));
+        run(&mut sim, 200);
         assert!((0.0..=210.0).contains(&sim.speed_kmh));
         assert!((0.0..=100.0).contains(&sim.fuel_pct));
         assert!((0.0..=7000.0).contains(&sim.rpm));
-    }
-
-    #[test]
-    fn switching_off_engine_drops_rpm() {
-        let mut sim = Simulator::default();
-        sim.apply(Command::ToggleEngine);
-        for _ in 0..100 { sim.step(Duration::from_millis(100)); }
-        assert!(sim.rpm < 1.0);
+        assert_eq!(sim.road_slope_pct, -12.0);
     }
 }

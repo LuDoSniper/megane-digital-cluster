@@ -122,3 +122,12 @@ une validation d'homologation. Certaines fonctions dépendent de l'équipement r
 et doivent être vérifiées sur la voiture. La logique du régulateur/limiteur simulé
 est guidée par la [documentation technique de la Mégane II](https://manualzz.com/doc/53328114/renault-megane-ii-manuel-utilisateur),
 **sans aucune prétention de représenter fidèlement les calculateurs Renault**.
+
+## Architecture des données et conduite assistée (v0.3)
+
+L'**affichage** reçoit un `VehicleSnapshot` (vitesse, régime, état des voyants, consignes et qualité des mesures). Il n'effectue aucune action sur la voiture. Le **simulateur** génère ces données et y applique toute la logique de régulation, limitation, inertie, pente et changement de rapport. Plus tard, un **fournisseur OBD-II en lecture seule** pourra remplacer la source du simulateur, mais ne devra pas appeler ses algorithmes. Voir [l'architecture détaillée](docs/ARCHITECTURE.md).
+
+- Régulateur simulé : `SET` à partir de 30 km/h, maintien de la vitesse sans accélérateur, veille au frein, à l'embrayage ou au changement de rapport, puis `RESUME`.
+- Limiteur simulé : plafonnement **effectif** de la demande moteur, sans freinage automatique ; dépassement volontaire (pédale ≥ 98 %) et avertissement en descente.
+- Le laboratoire (`F2`) montre la différence entre la **pédale demandée** et le **gaz réellement commandé** par les règles simulées. On peut également modifier l'embrayage (`J`) et la pente.
+- Ces règles s'inspirent de la documentation Renault X84 et **ne prétendent pas être une implémentation légale/certifiée ni identique à tous les niveaux d'équipement de 2004**. Aucun raccordement à un calculateur réel.

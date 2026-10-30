@@ -47,6 +47,7 @@ fn handle_shortcut(code: &str, sim: Signal<Simulator>, reading: Signal<VehicleSn
         "Digit4" | "Numpad4" => Some(Command::SetGear(Gear::Fourth)),
         "Digit5" | "Numpad5" => Some(Command::SetGear(Gear::Fifth)),
         "KeyR" | "NumpadDecimal" => Some(Command::SetGear(Gear::Reverse)),
+        "KeyJ" => Some(Command::Clutch(if state.clutch_pct > 2.0 { 0.0 } else { 100.0 })),
         "KeyQ" => Some(Command::ToggleLamp(Lamp::Left)),
         "KeyE" => Some(Command::ToggleLamp(Lamp::Right)),
         "KeyH" => Some(Command::ToggleHazards),
@@ -96,7 +97,7 @@ fn app() -> Element {
               'Digit0','Digit1','Digit2','Digit3','Digit4','Digit5',
               'Numpad0','Numpad1','Numpad2','Numpad3','Numpad4','Numpad5',
               'NumpadDecimal','NumpadEnter','NumpadAdd','NumpadSubtract',
-              'KeyR','KeyQ','KeyE','KeyH','KeyB','KeyF','KeyC','KeyV',
+              'KeyR','KeyJ','KeyQ','KeyE','KeyH','KeyB','KeyF','KeyC','KeyV',
               'KeyX','KeyZ','Space','Enter','Equal','Minus','F2','Escape']);
             const repeating = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','NumpadAdd','NumpadSubtract','Equal','Minus']);
             const handler = (event) => {
@@ -117,11 +118,9 @@ fn app() -> Element {
 
     let state = sim.read().clone();
     let data = reading.read().clone();
+    let sim_setpoint = state.assistance.setpoint_kmh.map(|v| format!("{v:.0} km/h")).unwrap_or_else(|| "—".to_string());
     let current_theme = theme();
     let theme_class = current_theme.class();
-    let status = if state.scenario == Scenario::SensorFailure { "CAPTEUR ABSENT" }
-        else if state.scenario == Scenario::LinkLost { "LIAISON PERDUE" }
-        else if state.paused { "PAUSE" } else { "SIMULATION" };
     let lab_class = if show_lab() { "lab-open" } else { "lab-closed" };
 
     rsx! {
@@ -140,13 +139,13 @@ fn app() -> Element {
                 div { class: "shortcut-help",
                     button { class: "help-close", onclick: move |_| show_help.set(false), "✕" }
                     strong { "RACCOURCIS SIMULATEUR" }
-                    p { "↑ ↓ : accélérateur ± 5 % · ← → : frein ± 5 % · Pavé numérique 1–5 : rapport · 0 : point mort · R ou . pavé : marche arrière (à l'arrêt)." }
+                    p { "↑ ↓ : accélérateur ± 5 % · ← → : frein ± 5 % · J : embrayage · Pavé numérique 1–5 : rapport · 0 : point mort · R ou . pavé : marche arrière (à l'arrêt)." }
                     p { "Q / E : clignotants · H : détresse · B : feux de croisement · F : pleins phares · C : régulateur · V : limiteur." }
                     p { "Entrée : mémoriser vitesse (≥ 30 km/h) · + / − : consigne · X : annuler · Z : reprendre · Espace : pause · F2 : labo · Échap : fermer." }
                 }
             }
             main { class: "instrument-workspace",
-                Instrument { data: data.clone(), status: status.to_string() }
+                Instrument { data: data.clone() }
                 if show_lab() {
                     aside { class: "control-panel",
                         div { class: "aside-header",
@@ -184,6 +183,18 @@ fn app() -> Element {
                             div { class: "range-header", span { class: "field-label", "FREIN" } strong { "{state.brake_pct:.0}%" } }
                             input { r#type: "range", min: "0", max: "100", step: "1", value: "{state.brake_pct:.0}",
                                 oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::Brake(v)); }
+                            }
+                            div { class: "range-header", span { class: "field-label", "EMBRAYAGE" } strong { "{state.clutch_pct:.0}%" } }
+                            input { r#type: "range", min: "0", max: "100", step: "1", value: "{state.clutch_pct:.0}",
+                                oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::Clutch(v)); }
+                            }
+                            div { class: "range-header", span { class: "field-label", "PENTE (DESCENTE − / MONTÉE +)" } strong { "{state.road_slope_pct:.0}%" } }
+                            input { r#type: "range", min: "-12", max: "12", step: "1", value: "{state.road_slope_pct:.0}",
+                                oninput: move |event| if let Ok(v) = event.value().parse::<f64>() { dispatch(sim, reading, Command::RoadSlope(v)); }
+                            }
+                            div { class: "sim-info-line",
+                                span { "PÉDALE DEMANDÉE · {state.accelerator_pct:.0}%" }
+                                strong { "GAZ EFFECTIF · {state.assistance.effective_throttle_pct:.0}%" }
                             }
                         }
                         div { class: "control-section",
@@ -226,7 +237,11 @@ fn app() -> Element {
                                 button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::AdjustAssistance(1.0)), "+ 1 km/h" }
                                 button { class: "action-button", onclick: move |_| dispatch(sim, reading, Command::CancelAssistance), "CANCEL" }
                             }
-                            small { class: "mini-help", "Activation ≥ 30 km/h ; frein = annulation du régulateur. Le limiteur accepte un dépassement simulé au-delà de 95 % d'accélérateur." }
+                            small { class: "mini-help", "Régulateur : maintient la consigne sans pédale ; frein / embrayage / changement de rapport = veille. Limiteur : plafonne le gaz, reste actif au freinage ; dépassement volontaire de 98 à 100 % (point dur simulé). Aucune assistance ne freine en descente." }
+                            div { class: "sim-info-line",
+                                span { "CONSIGNE : {sim_setpoint}" }
+                                strong { if state.assistance.active { "ACTIF" } else { "EN VEILLE / OFF" } }
+                            }
                         }
                         div { class: "control-section",
                             span { class: "field-label", "INJECTION DE VOYANTS (SIMULÉS)" }
