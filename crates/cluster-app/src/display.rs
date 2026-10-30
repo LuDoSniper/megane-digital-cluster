@@ -184,7 +184,7 @@ pub fn Instrument(data: VehicleSnapshot, layout: Layout) -> Element {
                     Telltale { name: "right", state: data.lights.right_indicator, tone: "green", prominent: true }
                 }
                 div { class: "cluster-instruments",
-                    Gauge { title: "VITESSE", display_value: speed, raw_value: data.speed_kmh.usable().copied(),
+                    Gauge { title: "VITESSE", display_value: speed.clone(), raw_value: data.speed_kmh.usable().copied(),
                         maximum: 240, step: 10, major_every: 4, unit: "km/h", kind: "speed" }
                     div { class: "cluster-primary",
                         if layout != Layout::Original {
